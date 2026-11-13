@@ -20,6 +20,7 @@ Captain builds on the work of open-source projects. This file attributes the ori
 | Avatars (`vendor/dicebear`) | https://github.com/dicebear/dicebear | MIT | Florian Körner |
 | Grammar checker (`vendor/harper/packages/obsidian-plugin`, `harper.js`) | https://github.com/Automattic/harper | Apache-2.0 | Harper contributors |
 | Inline agents (`vendor/inline-agents`) | https://github.com/danrfletcher/obsidian-inline-agents | MIT | Dan Fletcher |
+| Krakencel theme (`vendor/krakencel-theme`, fork of Vercel Geist) | https://github.com/en3sis/vercel-obsidian | MIT | Sorin Curescu (en3sis) |
 
 ## License compatibility
 

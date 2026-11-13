@@ -261,7 +261,37 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - [ ] Commands + context-menu
 - [ ] Tests
 
-## 5. Milestones
+### 4.9 Krakencel theme, code/notes mode, GitHub OAuth + worktree UI
+
+**Requirements**
+- R1. Package the Krakencel theme (customized fork of Vercel Geist) with Captain install.
+- R2. Code syntax colors correct in code mode.
+- R3. Toggle between Code and Notes transforms the content area.
+- R4. `<>` inline note to code: user writes an inline note inside code; the AI provider uses it as an edit instruction.
+- R5. GitHub sign-in via OAuth only (no API keys).
+- R6. On repo init, generate vault folders: GitActions, GitIssues.
+- R7. Git sidebar with worktree view: branches, commits, pull requests.
+- R8. Hover diff in code files; full diff history viewable.
+- R9. Attribution to theme author.
+
+**Acceptance criteria**
+- Installing Captain ships the Krakencel theme; user can select it.
+- Toggling Code/Notes switches the content area layout.
+- A `<>` note inside code produces an AI edit of that region.
+- GitHub login uses browser OAuth flow; no token pasted by user.
+- Init creates GitActions/ and GitIssues/ folders; sidebar shows branches, commits, PRs.
+- Hovering a changed line shows the diff; history shows all diffs.
+
+**Tasks**
+- [ ] Customize krakencel-theme (rename, palette, code colors)
+- [ ] Bundle theme with Captain install
+- [ ] Code/Notes toggle + content-area transform
+- [ ] `<>` inline-note-to-edit pipeline
+- [ ] GitHub OAuth sign-in (no keys)
+- [ ] Repo init: GitActions/ + GitIssues/ folders
+- [ ] Git sidebar: worktree, branches, commits, PRs
+- [ ] Hover diff + full diff history
+- [ ] Settings + tests
 
 - **M1**: Captain plugin scaffold + RAG chat working (4.1)
 - **M2**: Diagram generation (4.2)
@@ -272,6 +302,7 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - **M7**: Note linking & AI wiki (4.6)
 - **M8**: Git-based collaboration (4.7)
 - **M9**: Editor code mode, chat, integrations (4.8)
+- **M10**: Krakencel theme, code/notes mode, GitHub OAuth + worktree UI (4.9)
 
 ## 6. Open questions
 

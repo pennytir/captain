@@ -181,6 +181,33 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - [ ] End-to-end test jev-auto from Copilot
 - [ ] Run bun install for dev env
 
+### 4.7 Git-based collaboration framework
+
+**Requirements**
+- R1. Each published vault is a git repo (local + optional GitHub remote).
+- R2. Collaborators commit on branches; owner reviews and merges.
+- R3. Standard git protocols (clone, branch, commit, push, pull, merge).
+- R4. Permission gating: commit / merge / publish roles.
+- R5. GitHub integration: connect repo, push merged changes, sync.
+- R6. Conflict resolution UI.
+- R7. Audit log.
+
+**Acceptance criteria**
+- Collaborator can clone, branch, commit, push; owner merges to main.
+- Merged changes publish to the live site.
+- Optional GitHub remote syncs on merge.
+
+**Tasks**
+- [ ] Git-backed storage design
+- [ ] Collaborator commit flow
+- [ ] Owner merge flow
+- [ ] Permission gating
+- [ ] GitHub integration
+- [ ] Conflict resolution UI
+- [ ] Audit log
+- [ ] Settings
+- [ ] Tests
+
 ### 4.6 Note linking & AI wiki (auto-linker, custom folder links, ai-wiki)
 
 **Requirements**
@@ -213,6 +240,7 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - **M5**: Design tab + branding polish (4.3 design)
 - **M6**: OpenCodex proxy integration docs (4.5)
 - **M7**: Note linking & AI wiki (4.6)
+- **M8**: Git-based collaboration (4.7)
 
 ## 6. Open questions
 

@@ -181,6 +181,29 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - [ ] End-to-end test jev-auto from Copilot
 - [ ] Run bun install for dev env
 
+### 4.6 Note linking & AI wiki (auto-linker, custom folder links, ai-wiki)
+
+**Requirements**
+- R1. Auto-linker: scan vault, detect known terms, suggest/insert `[[wikilinks]]`.
+- R2. Custom folder links: resolve links within a folder scope.
+- R3. AI wiki: generate wiki pages from selected notes/folders using an LLM.
+- R4. Settings: enable/disable each feature, scopes, AI model/provider.
+- R5. Commands + context-menu entries for all three.
+
+**Acceptance criteria**
+- Given a note mentioning a term that has its own note, auto-linker suggests a wikilink.
+- Folder-scoped link resolves correctly within that folder.
+- AI wiki generates a coherent wiki page from 3+ notes.
+
+**Tasks**
+- [ ] Research each plugin
+- [ ] Integrate auto-linker
+- [ ] Integrate custom folder links
+- [ ] Integrate ai-wiki
+- [ ] Settings tab
+- [ ] Commands + context-menu
+- [ ] Tests
+
 ## 5. Milestones
 
 - **M1**: Captain plugin scaffold + RAG chat working (4.1)
@@ -189,6 +212,7 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - **M4**: Collaboration + anonymous sessions (4.3 collab + 4.4)
 - **M5**: Design tab + branding polish (4.3 design)
 - **M6**: OpenCodex proxy integration docs (4.5)
+- **M7**: Note linking & AI wiki (4.6)
 
 ## 6. Open questions
 

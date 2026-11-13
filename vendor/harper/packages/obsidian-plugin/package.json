@@ -1,0 +1,49 @@
+{
+	"name": "obsidian-plugin",
+	"private": true,
+	"version": "3.2.0",
+	"main": "main.js",
+	"devDependencies": {
+		"@playwright/test": "1.65.0",
+		"@rollup/plugin-node-resolve": "^16.0.0",
+		"@types/lodash-es": "^4.17.12",
+		"@types/node": "catalog:",
+		"@types/rollup-plugin-peer-deps-external": "^2.2.6",
+		"@vitest/browser": "^4.0.16",
+		"@vitest/browser-playwright": "^4.0.16",
+		"obsidian": "^1.7.2",
+		"playwright": "1.65.0",
+		"rollup": "4.35.0",
+		"rollup-plugin-peer-deps-external": "^2.2.4",
+		"rollup-plugin-svg-import": "^3.0.0",
+		"typescript": "catalog:",
+		"vite": "^6.3.5",
+		"vitest": "^4.0.16"
+	},
+	"scripts": {
+		"build": "vite build -l warn",
+		"check": "tsc --noEmit",
+		"dev": "vite build --watch",
+		"test": "vitest run"
+	},
+	"peerDependencies": {
+		"@codemirror/autocomplete": "^6.16.3",
+		"@codemirror/collab": "^6.1.1",
+		"@codemirror/commands": "^6.6.0",
+		"@codemirror/language": "^6.10.2",
+		"@codemirror/lint": "^6.8.1",
+		"@codemirror/search": "^6.5.6",
+		"@codemirror/state": "^6.4.1",
+		"@codemirror/view": "^6.28.3",
+		"@lezer/common": "^1.2.1",
+		"@lezer/highlight": "^1.2.0",
+		"@lezer/lr": "^1.4.1"
+	},
+	"dependencies": {
+		"crelt": "^1.0.5",
+		"harper.js": "workspace:*",
+		"lodash-es": "^4.17.21",
+		"minimatch": "^10.0.3",
+		"tslib": "catalog:"
+	}
+}

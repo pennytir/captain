@@ -1,0 +1,18 @@
+target
+build
+.idea
+.vscode
+.DS_Store
+*.pdf
+node_modules
+mariadb_data
+
+# Ignore direnv files
+.direnv/*
+
+# Fastlane / Bundler
+vendor/bundle/
+.bundle/*
+!.bundle/config
+fastlane/report.xml
+fastlane/README.md

@@ -1,0 +1,17 @@
+{
+	"$schema": "https://schemas.wp.org/trunk/block.json",
+	"apiVersion": 3,
+	"name": "harper/harper",
+	"version": "0.0.1",
+	"title": "Harper",
+	"category": "text",
+	"icon": "smiley",
+	"description": "Harper is the grammar checker that respects your privacy",
+	"example": {},
+	"supports": {
+		"html": false
+	},
+	"textdomain": "harper",
+	"editorScript": "file:./index.js",
+	"editorStyle": "file:./index.css"
+}

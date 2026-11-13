@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm ci --prefix server
+      - run: npm run build
+      - run: npm run guard:production-bundles
+      - run: npm run guard:no-tracked-generated-artifacts
+      - run: npm run guard:qa-isolation
+      - run: npm run build:server-release
+      - run: npm run test:ci
+      - run: npm --prefix server run typecheck
+
+      # Sanity check: the tag must match manifest.json version
+      - name: Verify tag matches manifest version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          if [ "$TAG" != "$MANIFEST_VERSION" ]; then
+            echo "::error::Tag ($TAG) does not match manifest.json version ($MANIFEST_VERSION)"
+            exit 1
+          fi
+
+      - name: Attest plugin release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip yaos.zip main.js manifest.json styles.css
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              yaos.zip \
+              dist/release-assets/yaos-server.zip \
+              dist/release-assets/update-manifest.json \
+              main.js \
+              manifest.json \
+              styles.css \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              yaos.zip \
+              dist/release-assets/yaos-server.zip \
+              dist/release-assets/update-manifest.json \
+              main.js \
+              manifest.json \
+              styles.css
+          fi

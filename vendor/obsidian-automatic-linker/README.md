@@ -1,0 +1,333 @@
+# 🪄 Automatic Linker 🔮
+
+Automatically convert plain text file references into Obsidian wiki links as you write. Keep your knowledge graph connected without manual linking.
+
+## Overview
+
+Automatic Linker scans your notes and intelligently converts text that matches file names in your vault into wiki links (`[[...]]`). Whether you're writing quick notes or maintaining a complex knowledge base, this plugin ensures your notes stay interconnected without interrupting your flow.
+
+## Installation
+
+### From Obsidian Community Plugins
+
+1. Open Settings → Community plugins
+2. Disable Safe mode
+3. Browse for "Automatic Linker"
+4. Click Install, then Enable
+
+### Manual Installation
+
+1. Download the latest release from [GitHub Releases](https://github.com/kdnk/obsidian-automatic-linker/releases)
+2. Extract `main.js`, `manifest.json`, and `styles.css` to your vault's `.obsidian/plugins/automatic-linker/` directory
+3. Reload Obsidian and enable the plugin in Settings → Community plugins
+
+## Key Features
+
+### Automatic Link Conversion
+
+The plugin automatically detects file names in your text and converts them to wiki links. It works seamlessly with:
+
+- **Format on Save**: Automatically convert links when saving files
+- **Selected Text**: Convert only highlighted body text via command palette; frontmatter, code, and existing links stay protected even when only part of them is selected
+- **Entire Vault**: Batch process files in your vault while respecting each note's `automatic-linker-off` setting
+- **CJK Support**: Full support for Japanese, Chinese, Korean, and other CJK languages
+- **Case Sensitivity**: Optional case-insensitive matching
+
+### Smart Namespace Management
+
+Organize large vaults with sophisticated namespace handling:
+
+- **Base Directory**: Use Obsidian's "Folder to create new notes in" setting as the base directory where folder prefixes are omitted from links
+- **Proximity-based Linking**: Automatically resolve shorthand links to their full namespaced paths
+- **Namespace Scope**: Use `automatic-linker-scoped: true` in frontmatter to restrict linking to files within the same namespace
+- **Closest Match Selection**: When multiple candidates exist, the plugin selects the file closest to your current note
+
+### URL Formatting
+
+Transform raw URLs into readable Markdown links automatically:
+
+- **GitHub URLs**: Convert `https://github.com/user/repo/issues/123` to `[user/repo#123](URL)`
+- **GitHub Enterprise**: Configure custom GitHub Enterprise domains
+- **Jira URLs**: Format Jira issue links with custom domain support
+- **Linear URLs**: Format Linear issue links
+- **Page Titles**: Fetch and replace bare URLs with `[Page Title](URL)` format (cached to minimize requests)
+
+### Advanced Link Control
+
+Fine-tune linking behavior to match your workflow:
+
+- **Alias Support**: Reference files by any of their frontmatter aliases
+- **Prevent Linking**: Add `automatic-linker-exclude: true` to frontmatter to exclude files from auto-linking
+- **Prevent Self-Linking**: Avoid creating links from a file to itself
+- **Remove Aliases**: Automatically strip aliases in specified directories
+- **Month Note Handling**: Ignore single/double digit references (1, 01, 12) unless namespaced
+- **Date Format Ignoring**: Skip date-formatted text (e.g., `2025-02-10`) for compatibility with Obsidian Tasks
+
+### Quality of Life Features
+
+- **Exclude Directories**: Prevent auto-linking in specified folders
+- **Preserve Existing Links**: Never reformats already-linked text
+- **Copy Without Links**: Copy note content with wiki links converted back to plain text
+- **Copy Selection Without Links**: Copy selected lines with minimal indentation and wiki links removed (supports path-style links like `[[path/to/file]]`)
+- **Debug Mode**: Detailed logging for troubleshooting
+- **Load Notices**: Optional notifications when files are processed
+
+## Commands
+
+Access these commands via the Command Palette (Cmd/Ctrl + P):
+
+| Command | Description |
+|---------|-------------|
+| **Automatic Linker: Format file** | Convert text to links in the current file |
+| **Automatic Linker: Format selection** | Convert only selected text to links |
+| **Automatic Linker: Format vault** | Batch process all files in your vault |
+| **Automatic Linker: Copy file without links** | Copy current file content with links as plain text |
+| **Automatic Linker: Copy selection without links** | Copy selected lines with minimal indent and links removed |
+| **Automatic Linker: Rebuild index** | Rebuild the file index for link candidates |
+
+## Configuration
+
+### Formatting Workflow
+
+**Format on save** converts links when you explicitly save a note. Automatic Linker then saves the note that received the save command, even if another pane becomes active during link conversion. With this setting disabled, saving delegates directly to Obsidian.
+
+When Bullet is enabled, Automatic Linker skips its own automatic formatting on save, regardless of Bullet's formatting, save, or integration settings. Disabling Bullet restores Automatic Linker's configured format-on-save behavior. Manual formatting commands and the `formatText` integration API remain available while Bullet is enabled. Automatic Linker does not run Prettier or Linter.
+
+Formatting preserves frontmatter exactly. Standalone commands preserve text typed during title lookup and apply fetched titles to the latest editor text. New URLs wait until the next formatting request for title lookup. Switching notes, renaming the file, changing editors, or unloading the plugin discards the pending editor update. Repeated requests are combined into one trailing run with the latest text.
+
+For plugin integrations, `isFormatOnSaveEnabled()` reports the linker save setting. `formatText(text, file, options)` returns a promise of transformed Markdown without changing an editor. The transform reads opt-outs from the supplied text, respects excluded folders, and fetches URL titles. Set `normalizeExistingWikilinks` in `options` to control existing-link normalization, subject to the linker's setting.
+
+### Link Behavior
+
+- **Respect 'Folder to create new notes in' setting**: Use Obsidian's new-note folder as the base directory when omitting folder prefixes from links.
+- **Proximity-based linking**: Resolve shorthand links to the candidate with the most path segments in common with the current file.
+- **Include aliases**: Include frontmatter aliases when matching text.
+- **Remove aliases in directories**: Remove displayed link aliases for links targeting the configured directories.
+- **Ignore case**: Match links without requiring the same letter case.
+- **Match sentence case**: When Ignore case is disabled, match text capitalized only because it starts a sentence.
+
+### Exclusions
+
+- **Prevent self-linking**: Do not link text to the current file.
+- **Ignore date formats**: Skip date-formatted text such as `2025-02-10`.
+- **Ignore headings**: Do not add links inside Markdown headings.
+- **Ignore Markdown tables**: Do not add links inside Markdown table rows.
+- **Exclude directories from automatic linking**: Skip files in the configured directories when building automatic links.
+
+### URL Formatting
+
+- **Format GitHub URLs on save**: Convert GitHub URLs to readable issue and pull-request links.
+- **GitHub Enterprise URLs**: Add custom GitHub Enterprise domains.
+- **Format JIRA URLs on save**: Convert JIRA issue URLs to readable links.
+- **JIRA URLs**: Add custom JIRA domains.
+- **Format Linear URLs on save**: Convert Linear issue URLs to readable links.
+- **Replace URL with title**: Replace bare URLs with Markdown links using fetched page titles.
+- **Ignore domains**: Exclude configured domains and their subdomains from URL title replacement, including URLs whose titles have already been cached. Prefix a domain with `*.` to exclude one or more subdomains without excluding the apex domain. For example, `google.com` excludes `google.com` and its subdomains, while `*.google.com` excludes `mail.google.com` but not `google.com`.
+
+### Diagnostics
+
+- **Show load notice**: Display a notice after the plugin loads Markdown files into its index.
+- **Debug mode**: Log debug information to the developer console.
+
+## Usage Examples
+
+### Example 1: Basic Linking
+
+You have files: `Python.md`, `JavaScript.md`, `pages/TypeScript.md`
+
+When you type:
+```
+I'm learning Python and JavaScript for web development.
+```
+
+It becomes:
+```
+I'm learning [[Python]] and [[JavaScript]] for web development.
+```
+
+### Example 2: Proximity-based Linking
+
+With Obsidian's "Folder to create new notes in" set to `pages/` and "Respect 'Folder to create new notes in' setting" enabled, along with Proximity-based Linking enabled:
+
+File structure:
+```
+pages/
+  languages/
+    Python.md
+    TypeScript.md
+  frameworks/
+    React.md
+```
+
+Current file: `pages/frameworks/React.md`
+
+When you type: `React uses TypeScript`
+
+It becomes: `[[frameworks/React]] uses [[languages/TypeScript]]`
+
+### Example 3: Namespace Scope
+
+File `pages/team-a/internal.md` has frontmatter:
+```yaml
+---
+automatic-linker-scoped: true
+---
+```
+
+Current file: `pages/team-a/notes.md`
+
+Typing `internal` creates `[[team-a/internal]]` ✅
+
+From `pages/team-b/notes.md`, typing `internal` won't link ❌
+
+### Example 4: URL Formatting
+
+Before:
+```
+Check out https://github.com/obsidianmd/obsidian-releases/issues/1234
+```
+
+After:
+```
+Check out [obsidianmd/obsidian-releases#1234](https://github.com/obsidianmd/obsidian-releases/issues/1234)
+```
+
+### Example 5: Copy Selection Without Links
+
+When you select part of a nested list:
+
+Selection in editor:
+```
+    - Priority about [[PBI]]
+        - High priority for near deadline
+    - Chapter [[PBI]]
+        - Up to 30% [[story point]] in sprint backlog
+```
+
+After running "Copy selection without links", clipboard contains:
+```
+- Priority about PBI
+	- High priority for near deadline
+- Chapter PBI
+	- Up to 30% story point in sprint backlog
+```
+
+Features:
+- Removes minimal indentation from selected lines
+- Converts path-style links: `[[path/to/file]]` → `file`
+- Preserves relative indentation structure
+- Gets full lines even if partially selected
+
+## Frontmatter Options
+
+Add these to individual note frontmatter:
+
+```yaml
+---
+# Disable formatting and URL title fetching in this file (including vault and selection commands)
+automatic-linker-off: true
+
+# Exclude this file from being automatically linked from other files
+automatic-linker-exclude: true
+
+# Restrict linking to same namespace only
+automatic-linker-scoped: true
+
+# Disable URL title fetching and replacement in this file
+automatic-linker-disable-url-title: true
+
+# Define aliases for this file (standard Obsidian feature)
+aliases: [shortname, alternative-name]
+---
+```
+
+## Development
+
+### Prerequisites
+
+- Node.js 16+
+- pnpm (or npm)
+
+### Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/kdnk/obsidian-automatic-linker.git
+cd obsidian-automatic-linker
+
+# Install dependencies
+pnpm install
+
+# Start development mode
+pnpm dev
+```
+
+### Available Commands
+
+```bash
+pnpm build              # Build for production
+pnpm dev                # Development mode with watch
+pnpm test               # Run all tests
+pnpm test:watch         # Run tests in watch mode
+pnpm tsc:watch          # TypeScript type checking in watch mode
+```
+
+### Running Specific Tests
+
+```bash
+# Run a specific test file
+npx vitest run src/path/to/test.ts
+
+# Run tests matching a pattern
+npx vitest run -t "test description"
+```
+
+### Project Structure
+
+```
+src/
+├── main.ts                    # Main plugin entry point
+├── settings/                  # Settings UI and types
+├── replace-links/             # Core link replacement logic
+├── replace-urls/              # URL formatting (GitHub, Jira, Linear)
+├── replace-url-with-title/    # Bare URL to titled link conversion
+├── exclude-links/             # Link exclusion logic
+├── remove-minimal-indent/     # Remove minimal indentation from text
+├── trie.ts                    # Trie data structure for efficient matching
+└── update-editor.ts           # Editor update utilities
+```
+
+## Troubleshooting
+
+**Links aren't being created:**
+- Ensure "Format on Save" is enabled or manually trigger the command
+- Verify the file isn't in an excluded directory
+
+**Proximity-based Linking not working:**
+- Ensure "Proximity-based Linking" is enabled in settings
+- Check that files are within Obsidian's configured "Folder to create new notes in" directory if the "Respect 'Folder to create new notes in' setting" option is enabled
+
+**Performance issues:**
+- Disable debug mode if enabled
+- Consider excluding large directories from auto-linking
+
+## Credits
+
+- `updateEditor` function adapted from [obsidian-linter](https://github.com/platers/obsidian-linter)
+
+## License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## Author
+
+**Kodai Nakamura**
+
+## Support
+
+- [GitHub Issues](https://github.com/kdnk/obsidian-automatic-linker/issues) - Bug reports and feature requests
+- [GitHub Discussions](https://github.com/kdnk/obsidian-automatic-linker/discussions) - Questions and community support
+
+---
+
+If you find this plugin useful, consider starring the repository on GitHub!

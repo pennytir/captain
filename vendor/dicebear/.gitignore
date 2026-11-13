@@ -1,0 +1,14 @@
+# Cache and log files
+.turbo
+.eslintcache
+.DS_Store
+yarn-error.log
+
+# Dependencies
+node_modules
+
+# Local environment files
+.env*.local
+
+# NuGet packages the CI jobs pack into before publishing
+dist-nuget

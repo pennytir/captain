@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <script type="module">
+    // We can import `harper.js` using native ECMAScript syntax.
+    import { binaryInlined } from 'https://unpkg.com/harper.js@2.4.0/dist/binaryInlined.js';
+    import { WorkerLinter } from 'https://unpkg.com/harper.js@2.4.0/dist/index.js';
+
+    // Since we are working in the browser, we can use either `WorkerLinter`, which doesn't block the event loop, or `LocalLinter`, which does.
+    const linter = new WorkerLinter({ binary: binaryInlined });
+
+    // Every time the `<textarea/>` received an input, we process it and update our list.
+    async function onInput(e) {
+      const lints = await linter.lint(e.target.value);
+
+      const list = document.getElementById('errorlist');
+      // Clear previous results
+      list.innerHTML = '';
+
+      for (const lint of lints) {
+        const item = document.createElement('LI');
+        const text = document.createTextNode(lint.message());
+        item.appendChild(text);
+        list.appendChild(item);
+      }
+    }
+
+    const inputField = document.getElementById('maininput');
+    inputField.addEventListener('input', onInput);
+    onInput({ target: inputField });
+  </script>
+
+  <!--Make the page look good using SimpleCSS-->
+  <link rel="stylesheet" href="https://cdn.simplecss.org/simple.min.css" />
+</head>
+
+<body>
+  <h1>Demo</h1>
+
+  <p>
+    This page is a simple example of using <code>harper.js</code> on a plain HTML page with a CDN.
+    It isn't pretty, but it demonstrates the fundamentals of using Harper. Start typing in the
+    text box below to start getting suggestions right in your browser.
+  </p>
+
+  <!--This is an intentional mistake to highlight the technology.-->
+  <textarea id="maininput">This is an test</textarea>
+
+  <h2>Errors</h2>
+
+  <ul id="errorlist">
+    Loading...
+  </ul>
+</body>
+
+</html>

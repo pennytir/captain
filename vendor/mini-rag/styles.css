@@ -1,0 +1,545 @@
+.mini-rag-question-box {
+	width: 100%;
+	height: 100px;
+	resize: none;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	background-color: var(--background-primary);
+	color: var(--text-normal);
+	padding: 8px;
+}
+
+.mini-rag-chat-container {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	overflow: hidden;
+}
+
+.mini-rag-chat-header {
+	flex-shrink: 0;
+	padding-bottom: 12px;
+	margin-bottom: 4px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.mini-rag-conversation {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+}
+
+.mini-rag-convo-box {
+	cursor: pointer;
+	width: fit-content;
+	max-width: 90%;
+	border-radius: var(--radius-m);
+	margin-top: 4px;
+	padding: 8px;
+	border: 1px solid var(--background-modifier-border);
+}
+
+.mini-rag-convo-box.mini-rag-query {
+	white-space: pre-line;
+	text-align: right;
+	align-self: flex-end;
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+	border-color: var(--interactive-accent);
+}
+
+.mini-rag-convo-box.mini-rag-response {
+	text-align: left;
+	background-color: var(--background-modifier-hover);
+	color: var(--text-normal);
+}
+
+/* MarkdownRenderer wraps content in <p> tags; strip the outer margin so
+   response bubbles match the padding-only sizing of query bubbles. */
+.mini-rag-convo-box.mini-rag-response p:first-child { margin-top: 0; }
+.mini-rag-convo-box.mini-rag-response p:last-child  { margin-bottom: 0; }
+
+.mini-rag-convo-box-streaming::after {
+	content: "";
+	display: inline-block;
+	width: 2px;
+	height: 1em;
+	margin-left: 3px;
+	vertical-align: text-bottom;
+	background-color: var(--text-muted);
+	animation: mini-rag-stream-cursor 1s step-end infinite;
+}
+
+@keyframes mini-rag-stream-cursor {
+	0%,
+	100% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0;
+	}
+}
+
+.mini-rag-input-label {
+	margin: 4px 0;
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+
+.mini-rag-button-area {
+	display: flex;
+	justify-content: space-between;
+}
+
+.mini-rag-button-area-left {
+	display: flex;
+	gap: 4px;
+	align-items: center;
+}
+
+.mini-rag-button-area-right {
+	display: flex;
+}
+
+.mini-rag-save-button-group {
+	display: inline-flex;
+	align-items: center;
+}
+
+.mini-rag-icon-button {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: content-box;
+	padding: var(--size-4-2);
+	border-radius: var(--radius-s);
+	color: var(--icon-color);
+	background: transparent;
+	border: none;
+	cursor: pointer;
+}
+
+.mini-rag-icon-button > span {
+	line-height: 1;
+}
+
+.mini-rag-icon-button svg {
+	display: block;
+}
+
+.mini-rag-icon-button:hover:not(:disabled) {
+	background-color: var(--background-modifier-hover);
+}
+
+.mini-rag-icon-button:disabled {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+
+.mini-rag-save-menu-button {
+	padding-left: var(--size-2-1);
+	padding-right: var(--size-2-1);
+}
+
+.mini-rag-send-button.mini-rag-icon-button {
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.mini-rag-send-button.mini-rag-icon-button:hover:not(:disabled) {
+	background-color: var(--interactive-accent-hover);
+}
+
+.mini-rag-save-as-modal .mini-rag-save-as-filename.setting-item {
+	flex-direction: column;
+	align-items: stretch;
+}
+
+.mini-rag-save-as-modal .mini-rag-save-as-filename .setting-item-info {
+	margin-right: 0;
+}
+
+.mini-rag-save-as-modal .mini-rag-save-as-filename .setting-item-control {
+	width: 100%;
+	padding-top: var(--size-4-2);
+}
+
+.mini-rag-save-as-modal .mini-rag-save-as-filename-input {
+	width: 100%;
+	box-sizing: border-box;
+}
+
+.mini-rag-settings-status {
+	display: flex;
+	flex-direction: row;
+	align-items: flex-start;
+	color: var(--text-muted);
+}
+
+.mini-rag-settings-status.is-error {
+	color: var(--text-error, var(--color-red));
+}
+
+.mini-rag-settings-status.is-warning {
+	color: var(--text-warning, var(--color-orange));
+}
+
+/*
+ * Why an embedding model is missing and what to run: a full-width line across the bottom of the
+ * setting row, which wraps to make room for it.
+ */
+.mini-rag-setting-with-hint {
+	flex-wrap: wrap;
+}
+
+/*
+ * Wrapping lets a long description push the controls onto a line of their own. A zero basis keeps
+ * the name and description beside the controls, so only the hint takes a line of its own; the
+ * controls keep their natural width rather than being squeezed.
+ */
+.mini-rag-setting-with-hint > .setting-item-info {
+	flex: 1 1 0;
+	min-width: 0;
+}
+
+.mini-rag-setting-with-hint > .setting-item-control {
+	flex: 0 0 auto;
+}
+
+.mini-rag-settings-hint {
+	display: flex;
+	flex-direction: column;
+	flex-basis: 100%;
+	gap: var(--size-2-2);
+	margin-top: var(--size-4-2);
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+
+.mini-rag-settings-hint-command {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--size-4-1);
+	max-width: 100%;
+	padding: var(--size-2-1) var(--size-2-1) var(--size-2-1) var(--size-4-2);
+	border-radius: var(--radius-s);
+	background-color: var(--background-secondary);
+}
+
+/* Wrapped rather than scrolled: a narrow description column clipped it behind a scrollbar. */
+.mini-rag-settings-hint-command code {
+	flex: 1;
+	min-width: 0;
+	align-self: center;
+	white-space: normal;
+	overflow-wrap: anywhere;
+	padding: 0;
+	background: none;
+	color: var(--text-normal);
+	font-family: var(--font-monospace);
+}
+
+/* A flag and its value, which the command never wraps between. */
+.mini-rag-settings-hint-command code span {
+	white-space: nowrap;
+}
+
+.mini-rag-settings-hint-command .mini-rag-inline-copy-btn {
+	flex-shrink: 0;
+	margin-left: 0;
+}
+
+/*
+ * While the embedding models are being listed: pulsing text over a sliding bar. Our own class,
+ * since Obsidian draws its own progress bar on any "is-loading" element, right over the text.
+ */
+.mini-rag-settings-status.mini-rag-checking {
+	position: relative;
+	width: fit-content;
+	min-width: 12em;
+	padding-bottom: var(--size-4-1);
+	color: var(--text-muted);
+	animation: mini-rag-pulse 1.2s ease-in-out infinite;
+}
+
+.mini-rag-settings-status.mini-rag-checking::after {
+	content: '';
+	position: absolute;
+	bottom: 0;
+	left: 0;
+	width: 30%;
+	height: 2px;
+	border-radius: 1px;
+	background-color: var(--interactive-accent);
+	animation: mini-rag-slide 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes mini-rag-slide {
+	from { left: 0; }
+	to { left: 70%; }
+}
+
+@keyframes mini-rag-pulse {
+	0%, 100% { opacity: 1; }
+	50% { opacity: 0.4; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.mini-rag-settings-status.mini-rag-checking,
+	.mini-rag-settings-status.mini-rag-checking::after {
+		animation: none;
+	}
+}
+
+/* Beside the "2. Connect to …" step heading. */
+.mini-rag-connection-status {
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+	font-weight: var(--font-normal);
+}
+
+.mini-rag-connection-status.is-connected {
+	color: var(--text-success, var(--color-green));
+}
+
+.mini-rag-connection-status.is-disconnected {
+	color: var(--text-warning, var(--color-orange));
+}
+
+/* On Obsidian 1.13+ the status is part of the heading's text, so it needs space after the name. */
+.setting-item-name > .mini-rag-connection-status {
+	margin-left: var(--size-4-2);
+}
+
+.mini-rag-settings-status.is-success {
+	color: var(--text-success, var(--color-green));
+}
+
+.mini-rag-inline-copy-btn {
+	display: inline-flex;
+	align-items: center;
+	margin-left: 6px;
+	padding: 2px 4px;
+	vertical-align: middle;
+	background: transparent;
+	border: none;
+	border-radius: var(--radius-s);
+	color: var(--icon-color);
+	cursor: pointer;
+}
+
+.mini-rag-inline-copy-btn:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+/* Support: the row at the top of the settings, set apart from the setup steps below it. */
+.mini-rag-support {
+	margin-bottom: var(--size-4-4);
+	padding: var(--size-4-3) var(--size-4-4);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	background-color: var(--background-secondary);
+}
+
+/* The banner's buttons, stacked on the right at one width, level with the title. */
+.mini-rag-support .setting-item-control {
+	flex-direction: column;
+	align-items: stretch;
+	align-self: flex-start;
+	gap: var(--size-4-2);
+}
+
+/* The support text gives its greeting a line of its own, in the banner and in the dialog. */
+.mini-rag-support .setting-item-description,
+.mini-rag-support-text {
+	white-space: pre-line;
+}
+
+/* The heart after "Support Mini-RAG", in the settings banner and the chat panel's support menu. */
+.mini-rag-support-heart {
+	display: inline-flex;
+	vertical-align: middle;
+	/* Centred on the text's middle, it sat low beside the capitals: a nudge up lines it up. */
+	position: relative;
+	top: -2px;
+	margin-left: var(--size-4-2);
+	color: var(--color-red);
+}
+
+/*
+ * The support menu's title has no icon of its own, but Obsidian still gives it an empty icon slot
+ * and the gap after it, which pushed the title right of the links' icons. Without the slot, it
+ * starts where they do. The chat panel marks the title's entry with this class.
+ */
+.mini-rag-support-menu-title .menu-item-icon {
+	display: none;
+}
+
+/* The heart sits at the far end of the chat panel's brand header. */
+.mini-rag-brand-header .mini-rag-support-button {
+	margin-left: auto;
+}
+
+.mini-rag-support-button:hover {
+	color: var(--color-red);
+}
+
+/* Index Error Screen - Start */
+.mini-rag-index-error {
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+
+.mini-rag-brand-header {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	color: var(--text-muted);
+	font-size: 0.8em;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+}
+
+.mini-rag-brand-icon {
+	display: flex;
+	align-items: center;
+	color: var(--interactive-accent);
+}
+
+.mini-rag-index-error-desc {
+	margin: 0;
+	color: var(--text-muted);
+	line-height: 1.5;
+}
+
+.mini-rag-index-error-steps {
+	margin: 0;
+	padding-left: 1.4em;
+}
+
+.mini-rag-index-error-steps li + li {
+	margin-top: var(--size-4-2);
+}
+
+/* The command sits inside its step, under the instruction to run it. */
+.mini-rag-index-error-steps .mini-rag-copy-command {
+	margin-top: var(--size-4-2);
+}
+
+.mini-rag-index-error-support {
+	margin: 0;
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+
+.mini-rag-copy-command {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	padding: 10px 12px;
+}
+
+.mini-rag-copy-command code {
+	flex: 1;
+	font-family: var(--font-monospace);
+	font-size: 0.9em;
+	color: var(--text-normal);
+	background: transparent;
+	word-break: break-all;
+}
+
+.mini-rag-refresh-button {
+	font-size: var(--font-ui-small);
+	padding: var(--size-4-2);
+	gap: 4px;
+}
+
+/* Index Error Screen - End */
+
+.mini-rag-model-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.mini-rag-model-row h3 {
+	margin: 0;
+}
+
+/* A quiet line about a request, e.g. which notes did not fit the model's context. */
+.mini-rag-context-note {
+	align-self: center;
+	max-width: 90%;
+	margin: var(--size-4-1) 0;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	font-style: italic;
+	text-align: center;
+}
+
+.mini-rag-model-switch-divider {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	align-self: stretch;
+	padding: 8px 0;
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+}
+
+.mini-rag-model-switch-line {
+	flex: 1;
+	height: 1px;
+	background-color: var(--background-modifier-border);
+}
+
+.mini-rag-model-switch-label {
+	white-space: nowrap;
+}
+
+/* Loading Animation - Start */
+.mini-rag-loader {
+	width: 16px;
+	height: 16px;
+	margin: 100px auto;
+	border-radius: 50%;
+	background-color: var(--text-muted);
+	box-shadow: 32px 0 var(--text-muted), -32px 0 var(--text-muted);
+	position: relative;
+	animation: mini-rag-triple-dot 750ms ease-out infinite alternate;
+}
+
+.mini-rag-loader.hidden,
+.mini-rag-summarize-button.hidden,
+.mini-rag-chat-header.hidden,
+.mini-rag-conversation.hidden,
+.mini-rag-input-area.hidden {
+	display: none;
+}
+
+@keyframes mini-rag-triple-dot {
+	0% {
+		background-color: color-mix(in srgb, var(--text-muted) 25%, transparent);
+		box-shadow: 32px 0 color-mix(in srgb, var(--text-muted) 25%, transparent),
+			-32px 0 var(--text-muted);
+	}
+	50% {
+		background-color: var(--text-muted);
+		box-shadow: 32px 0 color-mix(in srgb, var(--text-muted) 25%, transparent),
+			-32px 0 color-mix(in srgb, var(--text-muted) 25%, transparent);
+	}
+	100% {
+		background-color: color-mix(in srgb, var(--text-muted) 25%, transparent);
+		box-shadow: 32px 0 var(--text-muted),
+			-32px 0 color-mix(in srgb, var(--text-muted) 25%, transparent);
+	}
+}
+/* Loading Animation - End */

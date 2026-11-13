@@ -1,0 +1,603 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  assertCompleteSourceCoverage,
+  chunkMarkdownSource,
+  createSourceChunkForRange,
+  createSourceChunkRangeFactory,
+  extractMarkdownSections,
+} from "../src/markdown-chunks";
+import { contentHash } from "../src/content-hash";
+import { estimateText } from "../src/token-estimate";
+
+test("content hashes use stable FNV-1a values", () => {
+  assert.equal(contentHash(""), "fnv1a:811c9dc5");
+  assert.equal(contentHash("hello"), "fnv1a:4f9f2cab");
+});
+
+test("prepared range factory is equivalent and scans source only once", () => {
+  type RangeFactory = (
+    startLine: number,
+    endLine: number,
+    ordinal: number,
+    headingPath?: string[],
+  ) => ReturnType<typeof chunkMarkdownSource>[number];
+  const source = [
+    "# Root\r",
+    "```text\r",
+    ...Array.from({ length: 1_000 }, (_, index) => `value ${index.toString().padStart(4, "0")}\r`),
+    "```\r",
+    "tail\r",
+  ].join("\n");
+  const originalEncode = TextEncoder.prototype.encode;
+  let encodedCharacters = 0;
+  TextEncoder.prototype.encode = function(this: TextEncoder, input = "") {
+    encodedCharacters += input.length;
+    return originalEncode.call(this, input);
+  } as typeof TextEncoder.prototype.encode;
+
+  let prepared: RangeFactory;
+  try {
+    prepared = createSourceChunkRangeFactory(source);
+    for (let index = 0; index < 100; index++) {
+      prepared(3 + index, 3 + index, index, ["Root"]);
+    }
+  } finally {
+    TextEncoder.prototype.encode = originalEncode;
+  }
+
+  assert.ok(
+    encodedCharacters <= source.length * 2,
+    `prepared factory encoded ${encodedCharacters} characters for ${source.length} source characters`,
+  );
+  assert.deepEqual(
+    prepared(200, 240, 7, ["Root"]),
+    createSourceChunkForRange(source, 200, 240, 7, ["Root"]),
+  );
+});
+
+test("small source remains one stable chunk", () => {
+  const source = "# A\n\nParagraph one.\n\n## B\nParagraph two.";
+  const first = chunkMarkdownSource(source, { maxEstimatedTokens: 500, overlapLines: 2 });
+  const second = chunkMarkdownSource(source, { maxEstimatedTokens: 500, overlapLines: 2 });
+  assert.equal(first.length, 1);
+  assert.deepEqual(first, second);
+  assertCompleteSourceCoverage(source, first);
+});
+
+test("heading and paragraph splits cover every original line", () => {
+  const source = ["# Root", "", ...Array.from({ length: 40 }, (_, i) => `line ${i}`), "", "## Tail", "done"].join("\n");
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 80, overlapLines: 1 });
+  assert.ok(chunks.length > 1);
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+  assert.equal(chunks.every((chunk) => chunk.markdown.length > 0), true);
+});
+
+test("oversized fenced blocks retain fence language and source anchors", () => {
+  const source = ["# Code", "```bash", ...Array.from({ length: 30 }, (_, i) => `echo ${i}`), "```"].join("\n");
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 60, overlapLines: 2 });
+  assert.ok(chunks.length > 1);
+  assert.equal(chunks.every((chunk) => chunk.markdown.includes("```bash") && chunk.markdown.includes("```")), true);
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("every returned chunk stays within the strict token budget", () => {
+  const fixtures = [
+    {
+      source: ["# Root", "", ...Array.from({ length: 40 }, (_, i) => `paragraph line ${i}`)].join("\n"),
+      maxEstimatedTokens: 80,
+      overlapLines: 1,
+    },
+    {
+      source: ["# Code", "```bash", ...Array.from({ length: 30 }, (_, i) => `echo ${i}`), "```"].join("\n"),
+      maxEstimatedTokens: 60,
+      overlapLines: 2,
+    },
+    {
+      // A numeric line is dense enough that its own class sum is capped at what
+      // a tokenizer can bill, while the window around it is not. Summing capped
+      // per-line estimates hides that overage, so the window measures under
+      // budget and renders over it; only these mixed lines expose it.
+      source: Array.from({ length: 20 }, (_, index) => [
+        `${index},${"1,".repeat(45)}`,
+        "prose line describing the measurement above in ordinary words",
+      ]).flat().join("\n"),
+      maxEstimatedTokens: 400,
+      overlapLines: 1,
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    const chunks = chunkMarkdownSource(fixture.source, fixture);
+    assert.equal(
+      chunks.every((chunk) => estimateText(chunk.markdown) <= fixture.maxEstimatedTokens),
+      true,
+    );
+  }
+});
+
+test("a range that exactly fills its budget is not split by float drift", () => {
+  // The window measure is a difference of running per-line sums; the estimate it
+  // has to agree with divides once, over the whole range. Word characters cost
+  // 1/8.1 and a newline 1.1, so 81 word characters over 11 lines is exactly
+  // 10 + 11 = 21 tokens — and float arithmetic put the summed form a hair above
+  // that, which `Math.ceil` turned into 22. The source then failed a budget it
+  // exactly fills, and chunked into two. The uneven line lengths matter: equal
+  // ones sum without error.
+  const source = [7, 21, 35, 1, 3, 7, 3, 1, 1, 1, 1].map((n) => "a".repeat(n)).join("\n");
+  assert.equal(estimateText(source), 21);
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 21, overlapLines: 0 });
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].markdown, source);
+});
+
+test("a window measure agrees with the estimate of the text it renders", () => {
+  // The property behind the case above. Drift only reaches `Math.ceil` when the
+  // exact sum is an integer, so the shapes here are built to be exactly integral
+  // — 81·k word characters over 10·m + 1 lines — and the line lengths are uneven,
+  // because equal ones sum without error. Agreement has to be exact: measuring
+  // high wastes budget, measuring low renders over it.
+  let failures = 0;
+  for (const lineCount of [11, 21, 31]) {
+    for (const totalWords of [81, 162, 243, 405]) {
+      for (let shape = 1; shape <= 40; shape++) {
+        const lines: string[] = [];
+        let left = totalWords;
+        for (let index = 0; index < lineCount; index++) {
+          const room = Math.max(left - (lineCount - index - 1), 0);
+          const take = index === lineCount - 1 ? left : (shape * (index + 7) + index * 13) % (room + 1);
+          lines.push("a".repeat(take));
+          left -= take;
+        }
+        if (left !== 0) continue;
+        const text = lines.join("\n");
+        const budget = estimateText(text);
+        if (chunkMarkdownSource(text, { maxEstimatedTokens: budget, overlapLines: 0 }).length !== 1) {
+          failures++;
+        }
+      }
+    }
+  }
+  assert.equal(failures, 0, `${failures} exactly-fitting ranges were split by their own budget`);
+});
+
+test("a source line larger than the budget fails with its range and required size", () => {
+  const source = "x".repeat(64);
+  const required = estimateText(source);
+  assert.throws(
+    () => chunkMarkdownSource(source, { maxEstimatedTokens: required - 1, overlapLines: 0 }),
+    new RegExp(`range 1-1 requires ${required} estimated tokens but budget is ${required - 1}`, "i"),
+  );
+});
+
+test("mandatory fence wrappers larger than the budget fail with their source range", () => {
+  const source = "```lang\n1234567890\n```";
+  // Budget 8 is large enough for the opening fence line alone but too small
+  // for the fenced content line, which must carry synthetic open/close
+  // fence overhead — so range 2-2 is the one that fails.
+  assert.throws(
+    () => chunkMarkdownSource(source, { maxEstimatedTokens: 8, overlapLines: 0 }),
+    /range 2-2 requires \d+ estimated tokens but budget is 8/i,
+  );
+});
+
+test("coverage validation rejects a missing line", () => {
+  const source = "one\ntwo\nthree";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  chunks[0].endLine = 2;
+  assert.throws(() => assertCompleteSourceCoverage(source, chunks), /line 3/);
+});
+
+test("empty source has no chunks and complete coverage", () => {
+  const chunks = chunkMarkdownSource("", { maxEstimatedTokens: 100, overlapLines: 2 });
+  assert.deepEqual(chunks, []);
+  assert.doesNotThrow(() => assertCompleteSourceCoverage("", chunks));
+});
+
+test("maxEstimatedTokens must be a positive safe integer", () => {
+  for (const maxEstimatedTokens of [0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => chunkMarkdownSource("source", { maxEstimatedTokens, overlapLines: 0 }),
+      /maxEstimatedTokens must be a positive safe integer/i,
+    );
+  }
+});
+
+test("overlapLines must be a non-negative safe integer", () => {
+  for (const overlapLines of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => chunkMarkdownSource("source", { maxEstimatedTokens: 100, overlapLines }),
+      /overlapLines must be a non-negative safe integer/i,
+    );
+  }
+});
+
+test("CRLF and a trailing newline remain byte-stable", () => {
+  const source = "# Root\r\n\r\nBody\r\n";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].startLine, 1);
+  assert.equal(chunks[0].endLine, 4);
+  assert.equal(chunks[0].markdown, source);
+  assert.equal(chunks[0].contentHash, contentHash(source));
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("nested headings produce stable hierarchical paths", () => {
+  const source = [
+    "# Root",
+    `root ${"x".repeat(20)}`,
+    "## Child",
+    `child ${"x".repeat(20)}`,
+    "### Leaf",
+    `leaf ${"x".repeat(20)}`,
+    "## Sibling",
+    `sibling ${"x".repeat(20)}`,
+  ].join("\n");
+  // Rescaled from a byte-era budget of 45 for the token estimator (task-3
+  // prompt-budget-automation): 15 tokens keeps the same one-section-per-chunk
+  // split this test asserts below.
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 15, overlapLines: 1 });
+
+  assert.deepEqual(chunks.map((chunk) => chunk.headingPath), [
+    ["Root"],
+    ["Root", "Child"],
+    ["Root", "Child", "Leaf"],
+    ["Root", "Sibling"],
+  ]);
+  assert.deepEqual(chunks.map((chunk) => [chunk.startLine, chunk.endLine]), [
+    [1, 2],
+    [3, 4],
+    [5, 6],
+    [7, 8],
+  ]);
+  assert.deepEqual(chunks.map((chunk) => chunk.ordinal), [0, 1, 2, 3]);
+  assert.equal(chunks.every((chunk) => chunk.id === `${chunk.ordinal}:${chunk.startLine}-${chunk.endLine}:${chunk.contentHash}`), true);
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("extractMarkdownSections exposes stable ATX sections from the shared scanner", () => {
+  const source = "# Root\nroot body\n## Child\nchild body";
+  const sections = extractMarkdownSections(source);
+
+  assert.deepEqual(sections.map((section) => ({
+    heading: section.heading,
+    headingPath: section.headingPath,
+    startLine: section.startLine,
+    endLine: section.endLine,
+    markdown: section.markdown,
+  })), [
+    {
+      heading: "Root",
+      headingPath: ["Root"],
+      startLine: 1,
+      endLine: 2,
+      markdown: "# Root\nroot body",
+    },
+    {
+      heading: "Child",
+      headingPath: ["Root", "Child"],
+      startLine: 3,
+      endLine: 4,
+      markdown: "## Child\nchild body",
+    },
+  ]);
+  assert.equal(sections.every((section) => section.contentHash === contentHash(section.markdown)), true);
+});
+
+test("Setext underlines remain paragraph text because section extraction is ATX-only", () => {
+  const source = "Title\n=====\n\nBody";
+  const sections = extractMarkdownSections(source);
+  assert.equal(sections.length, 1);
+  assert.equal(sections[0].heading, "");
+  assert.deepEqual(sections[0].headingPath, []);
+  assert.equal(sections[0].markdown, source);
+});
+
+test("section extraction attaches a blank-only leading preamble to the first ATX section", () => {
+  const source = "\n\n# Root\nbody\n## Child\nchild body";
+  const sections = extractMarkdownSections(source);
+
+  assert.equal(sections.length, 2);
+  assert.equal(sections[0].heading, "Root");
+  assert.deepEqual(sections[0].headingPath, ["Root"]);
+  assert.equal(sections[0].startLine, 1);
+  assert.equal(sections[0].endLine, 4);
+  assert.equal(sections[0].markdown, "\n\n# Root\nbody");
+});
+
+test("chunking never emits a blank-only leading preamble chunk", () => {
+  const source = [
+    "",
+    "",
+    "# Root",
+    "",
+    ...Array.from({ length: 20 }, (_, i) => `body line ${i}`),
+  ].join("\n");
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 60, overlapLines: 1 });
+
+  assert.equal(chunks[0].startLine, 1);
+  assert.equal(chunks.every((chunk) => chunk.markdown.trim().length > 0), true);
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("a leading blank range fails loud when it cannot share the heading budget", () => {
+  // Rescaled twice for the token estimator: from a byte-era budget of 3, then
+  // to 2 when the character-class rules made a heading line cost 2 tokens.
+  // Budget 2 fits the heading alone and is still too small to coalesce.
+  assert.throws(
+    () => chunkMarkdownSource("\n# H", { maxEstimatedTokens: 2, overlapLines: 0 }),
+    /blank source range 1-1 cannot be coalesced.*budget 2/i,
+  );
+});
+
+test("blank paragraph separators coalesce with an adjacent range when the result fits", () => {
+  const source = "a\n\n\nb";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 2, overlapLines: 0 });
+
+  assert.deepEqual(chunks.map((chunk) => [chunk.startLine, chunk.endLine, chunk.markdown]), [
+    [1, 2, "a\n"],
+    [3, 4, "\nb"],
+  ]);
+  assert.equal(chunks.every((chunk) => chunk.markdown.length > 0), true);
+  assert.equal(chunks.every((chunk) => estimateText(chunk.markdown) <= 2), true);
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("a blank paragraph separator fails loud when neither adjacent range fits", () => {
+  assert.throws(
+    () => chunkMarkdownSource("a\n\nb", { maxEstimatedTokens: 1, overlapLines: 0 }),
+    /blank source range 2-2 cannot be coalesced.*budget 1/i,
+  );
+});
+
+test("oversized sections split at blank lines before using overlap", () => {
+  const source = [
+    "# Root",
+    "",
+    `first ${"a".repeat(24)}`,
+    "",
+    `second ${"b".repeat(24)}`,
+    "",
+    `third ${"c".repeat(24)}`,
+  ].join("\n");
+  // Rescaled from a byte-era budget of 40 for the token estimator (task-3
+  // prompt-budget-automation): 15 tokens reproduces the same blank-line splits.
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 15, overlapLines: 2 });
+
+  assert.ok(chunks.length > 1);
+  for (let index = 1; index < chunks.length; index++) {
+    assert.equal(chunks[index].startLine, chunks[index - 1].endLine + 1);
+  }
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("tilde fences keep their original language and ignore headings inside code", () => {
+  const source = [
+    "# Code",
+    "~~~typescript",
+    "## not a heading",
+    ...Array.from({ length: 20 }, (_, i) => `const value${i} = ${i};`),
+    "~~~",
+  ].join("\n");
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 90, overlapLines: 1 });
+
+  assert.ok(chunks.length > 1);
+  assert.equal(chunks.every((chunk) => chunk.headingPath.join("/") === "Code"), true);
+  assert.equal(chunks.every((chunk) => chunk.markdown.includes("~~~typescript") && chunk.markdown.includes("~~~")), true);
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("longer backtick fences are not closed by shorter delimiters", () => {
+  const source = [
+    "# Code",
+    "````js",
+    "```",
+    ...Array.from({ length: 16 }, (_, i) => `value(${i});`),
+    "````",
+  ].join("\n");
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 60, overlapLines: 1 });
+
+  assert.ok(chunks.length > 1);
+  assert.equal(chunks.every((chunk) => chunk.markdown.includes("````js") && chunk.markdown.includes("````")), true);
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("line windows overlap by the configured number of original lines", () => {
+  const source = Array.from({ length: 12 }, (_, i) => `line ${i} ${"x".repeat(12)}`).join("\n");
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 30, overlapLines: 2 });
+
+  assert.ok(chunks.length > 1);
+  for (let index = 1; index < chunks.length; index++) {
+    assert.equal(chunks[index].startLine, chunks[index - 1].endLine - 1);
+  }
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("line-window sizing performs bounded byte-encoding work", () => {
+  const source = Array.from({ length: 1_000 }, (_, i) => `line-${i.toString().padStart(4, "0")}`).join("\n");
+  const originalEncode = TextEncoder.prototype.encode;
+  let encodedCharacters = 0;
+  TextEncoder.prototype.encode = function(this: TextEncoder, input = "") {
+    encodedCharacters += input.length;
+    return originalEncode.call(this, input);
+  } as typeof TextEncoder.prototype.encode;
+
+  let chunks: ReturnType<typeof chunkMarkdownSource>;
+  try {
+    chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 500, overlapLines: 1 });
+  } finally {
+    TextEncoder.prototype.encode = originalEncode;
+  }
+
+  assert.ok(chunks.length > 1);
+  assert.ok(
+    encodedCharacters <= source.length * 8,
+    `encoded ${encodedCharacters} characters for ${source.length} source characters`,
+  );
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("overlap that cannot preserve progress is rejected clearly", () => {
+  const source = Array.from({ length: 6 }, (_, i) => `${i}:${"x".repeat(18)}`).join("\n");
+  // Rescaled twice for the token estimator: from a byte-era budget of 41, then
+  // to 13 when the character-class rules repriced these lines. It still forces
+  // the range 1-2 window.
+  assert.throws(
+    () => chunkMarkdownSource(source, { maxEstimatedTokens: 13, overlapLines: 2 }),
+    /overlapLines 2 prevents progress after source range 1-2/i,
+  );
+});
+
+test("synthetic fence wrappers are excluded from the source content hash", () => {
+  const sourceLines = [
+    "# Code",
+    "```rust",
+    ...Array.from({ length: 24 }, (_, i) => `let value_${i} = ${i};`),
+    "```",
+  ];
+  const source = sourceLines.join("\n");
+  // Rescaled from a byte-era budget of 80 for the token estimator (task-3
+  // prompt-budget-automation): 40 tokens still splits the fenced block so a
+  // middle chunk is fully wrapped by synthetic fence delimiters.
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 40, overlapLines: 1 });
+  const wrapped = chunks.find((chunk) => chunk.startLine > 2 && chunk.endLine < sourceLines.length);
+
+  assert.ok(wrapped);
+  const originalLines = sourceLines.slice(wrapped.startLine - 1, wrapped.endLine).join("\n");
+  assert.equal(wrapped.markdown, `\`\`\`rust\n${originalLines}\n\`\`\``);
+  assert.equal(wrapped.contentHash, contentHash(originalLines));
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+
+  wrapped.markdown = wrapped.markdown.replace(originalLines, `${originalLines}\ntampered`);
+  assert.throws(() => assertCompleteSourceCoverage(source, chunks), /markdown does not match source range/i);
+});
+
+test("coverage validation rejects markdown and hash tampered together", () => {
+  const source = "one\ntwo";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  chunks[0].markdown = "one\nchanged";
+  chunks[0].contentHash = contentHash(chunks[0].markdown);
+  chunks[0].id = `0:1-2:${chunks[0].contentHash}`;
+
+  assert.throws(
+    () => assertCompleteSourceCoverage(source, chunks),
+    /markdown does not match source range 1-2/i,
+  );
+});
+
+test("coverage validation rejects a missing synthetic fence wrapper", () => {
+  const sourceLines = [
+    "```rust",
+    ...Array.from({ length: 16 }, (_, i) => `let value_${i} = ${i};`),
+    "```",
+  ];
+  const source = sourceLines.join("\n");
+  // Rescaled from a byte-era budget of 80 for the token estimator (task-3
+  // prompt-budget-automation): 40 tokens still splits the fenced block so a
+  // middle chunk is fully wrapped by synthetic fence delimiters.
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 40, overlapLines: 1 });
+  const wrapped = chunks.find((chunk) => chunk.startLine > 1 && chunk.endLine < sourceLines.length);
+  assert.ok(wrapped);
+  wrapped.markdown = sourceLines.slice(wrapped.startLine - 1, wrapped.endLine).join("\n");
+
+  assert.throws(
+    () => assertCompleteSourceCoverage(source, chunks),
+    new RegExp(`markdown does not match source range ${wrapped.startLine}-${wrapped.endLine}`, "i"),
+  );
+});
+
+test("coverage validation rejects an altered synthetic fence wrapper", () => {
+  const sourceLines = [
+    "```rust",
+    ...Array.from({ length: 16 }, (_, i) => `let value_${i} = ${i};`),
+    "```",
+  ];
+  const source = sourceLines.join("\n");
+  // Rescaled from a byte-era budget of 80 for the token estimator (task-3
+  // prompt-budget-automation): 40 tokens still splits the fenced block so a
+  // middle chunk is fully wrapped by synthetic fence delimiters.
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 40, overlapLines: 1 });
+  const wrapped = chunks.find((chunk) => chunk.startLine > 1 && chunk.endLine < sourceLines.length);
+  assert.ok(wrapped);
+  wrapped.markdown = wrapped.markdown.replace("```rust", "```text");
+
+  assert.throws(
+    () => assertCompleteSourceCoverage(source, chunks),
+    new RegExp(`markdown does not match source range ${wrapped.startLine}-${wrapped.endLine}`, "i"),
+  );
+});
+
+test("coverage validation rejects a stale range even when overlap keeps full coverage", () => {
+  const source = Array.from({ length: 12 }, (_, i) => `line ${i} ${"x".repeat(12)}`).join("\n");
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 30, overlapLines: 2 });
+  const stale = chunks[1];
+  stale.startLine += 1;
+  stale.id = `${stale.ordinal}:${stale.startLine}-${stale.endLine}:${stale.contentHash}`;
+
+  assert.throws(
+    () => assertCompleteSourceCoverage(source, chunks),
+    new RegExp(`markdown does not match source range ${stale.startLine}-${stale.endLine}`, "i"),
+  );
+});
+
+test("coverage validation rejects an ordinal that differs from array position", () => {
+  const source = "one\ntwo";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  chunks[0].ordinal = 1;
+  assert.throws(
+    () => assertCompleteSourceCoverage(source, chunks),
+    /ordinal 1.*array position 0/i,
+  );
+});
+
+test("coverage validation rejects a hash not derived from the source slice", () => {
+  const source = "one\ntwo";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  chunks[0].contentHash = contentHash("different");
+  chunks[0].id = `0:1-2:${chunks[0].contentHash}`;
+  assert.throws(
+    () => assertCompleteSourceCoverage(source, chunks),
+    /content hash.*source range 1-2/i,
+  );
+});
+
+test("coverage validation rejects an ID that differs from ordinal, range, and hash", () => {
+  const source = "one\ntwo";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  chunks[0].id = "wrong";
+  assert.throws(
+    () => assertCompleteSourceCoverage(source, chunks),
+    /id wrong.*expected 0:1-2:fnv1a:/i,
+  );
+});
+
+test("coverage validation accepts intentional overlapping ranges", () => {
+  const source = Array.from({ length: 10 }, (_, i) => `line ${i} ${"x".repeat(10)}`).join("\n");
+  // Rescaled from a byte-era budget of 70 for the token estimator (task-3
+  // prompt-budget-automation): 25 tokens still forces overlapping windows.
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 25, overlapLines: 2 });
+  assert.ok(chunks.some((chunk, index) => index > 0 && chunk.startLine <= chunks[index - 1].endLine));
+  assert.doesNotThrow(() => assertCompleteSourceCoverage(source, chunks));
+});
+
+test("coverage validation rejects a start before the source", () => {
+  const source = "one\ntwo";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  chunks[0].startLine = 0;
+  assert.throws(() => assertCompleteSourceCoverage(source, chunks), /outside.*source/i);
+});
+
+test("coverage validation rejects an end after the source", () => {
+  const source = "one\ntwo";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  chunks[0].endLine = 3;
+  assert.throws(() => assertCompleteSourceCoverage(source, chunks), /outside.*source/i);
+});
+
+test("coverage validation rejects a stale non-fenced chunk hash", () => {
+  const source = "one\ntwo";
+  const chunks = chunkMarkdownSource(source, { maxEstimatedTokens: 100, overlapLines: 0 });
+  chunks[0].contentHash = contentHash("changed");
+  assert.throws(() => assertCompleteSourceCoverage(source, chunks), /hash/i);
+});

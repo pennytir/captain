@@ -1,0 +1,27 @@
+{
+	"id": "discussion-brief-cards",
+	"name": "Discussion Brief Cards",
+	"version": "1.1.3",
+	"changes": [
+		"The Pro notice of Discussion Brief Cards now says that one payment turns on Pro in every NoteMods plugin."
+	],
+	"tip": "Select Refresh on a card to load the current text and answer state after a discussion changes.",
+	"thanks": "Hi, I am Michael, a solo developer in Poland. Discussion Brief Cards is one of over 100 small plugins that I make. Thank you for using it to keep project discussions beside your notes.",
+	"related": [
+		{
+			"id": "enterprise-issue-cards",
+			"name": "Enterprise Issue Cards",
+			"blurb": "Read Enterprise issues as text cards with local copies."
+		},
+		{
+			"id": "conventional-commit-draft",
+			"name": "Conventional Commit Draft",
+			"blurb": "Group selected conventional commit subjects into a new release draft."
+		},
+		{
+			"id": "junit-failure-notes",
+			"name": "JUnit Failure Notes",
+			"blurb": "Convert a local JUnit XML report into a note with test counts and folded failure logs."
+		}
+	]
+}

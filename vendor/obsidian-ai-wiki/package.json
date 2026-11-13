@@ -1,0 +1,40 @@
+{
+  "name": "obsidian-ai-wiki",
+  "version": "0.3.14",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "audit:all": "npm audit",
+    "audit:prod": "npm audit --omit=dev",
+    "lint": "eslint . --max-warnings 0",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "release:validate:pre": "node scripts/validate-release.mjs --phase prebuild",
+    "release:validate:post": "node scripts/validate-release.mjs --phase postbuild",
+    "eval:mobile-fixes:build": "esbuild tests/eval/mobile-fixes/run.ts --bundle --platform=node --alias:obsidian=./tests/eval/mobile-fixes/obsidian-stub.ts --loader:.md=text --outfile=tests/eval/mobile-fixes/run.cjs",
+    "migrate:wiki-prefix": "tsx scripts/migrate-wiki-prefix.ts",
+    "eval": "tsx scripts/eval.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/path-browserify": "^1.0.3",
+    "esbuild": "^0.28.0",
+    "eslint": "^9.39.4",
+    "eslint-plugin-obsidianmd": "0.4.1",
+    "obsidian": "1.13.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.4.0",
+    "typescript-eslint": "^8.60.1"
+  },
+  "dependencies": {
+    "jsonrepair": "^3.14.0",
+    "openai": "^6.34.0",
+    "path-browserify": "^1.0.1",
+    "undici": "^6.28.0",
+    "yaml": "^2.9.0",
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.25.2"
+  }
+}

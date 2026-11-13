@@ -1,0 +1,1774 @@
+import { App, ItemView, Modal, WorkspaceLeaf, MarkdownRenderer, Component, Notice, Platform, setIcon } from "obsidian";
+import { AddDomainModal, BusyCloseModal, ConfirmModal, ManageSourcesModal, IngestScopeModal, LintOptionsModal, ReinitModeModal } from "./modals";
+import type LlmWikiPlugin from "./main";
+import type { ChatMessage, RunEvent, RunHistoryEntry, WikiOperation } from "./types";
+import type { DomainEntry } from "./domain";
+import { i18n, i18nFor, resolveLang, resolveUiLang } from "./i18n";
+import { isSourceFile } from "./source-deletion";
+import { resolveRerunDomain } from "./rerun-domain";
+import { domainWikiFolder, domainLogPath, domainIndexPath, isWikiArticlePath, effectiveSubfolder } from "./wiki-path";
+import { computeSpeedText } from "./phases/llm-utils";
+import { isAbsolute, relative } from "path-browserify";
+import { queryDegradeLines, retrievalTag } from "./retrieval-diag";
+import { OPERATION_AXES, type Rating } from "./eval-log";
+import {
+  emptyLlmLifecycleState,
+  lifecycleScale,
+  LlmLifecycleWaitingTimers,
+  popToolRenderFrame,
+  pushToolRenderFrame,
+  reduceLlmLifecycle,
+  renderLifecycleScale,
+  resetReasoningForLifecycle,
+  shouldSuppressLegacyLlmTool,
+  type LlmLifecycleEvent,
+  type LlmLifecycleState,
+  type ToolRenderFrame,
+} from "./llm-lifecycle";
+
+import { collectMdInPaths, walkFolder } from "./utils/vault-walk";
+export { collectMdInPaths, walkFolder };
+
+export const AI_WIKI_VIEW_TYPE = "ai-wiki-view";
+export const AI_WIKI_DISPLAY_NAME = "AI Wiki";
+
+export function isTelemetryOnlyRunEvent(event: RunEvent): boolean {
+  return event.kind === "run_config"
+    || event.kind === "wipe_manifest_chunk"
+    || event.kind === "wipe_complete"
+    || event.kind === "index_effect"
+    || event.kind === "llm_request_fingerprint"
+    || event.kind === "native_transport_correlation"
+    || event.kind === "native_http_response"
+    || event.kind === "native_transport_trace"
+    // Automatic-budget telemetry: resolved budgets, context-window probes, calibration
+    // samples and evidence splits are agent-log numbers, never sidebar text. Listed
+    // here so "technical numbers never reach the sidebar" is enforced by this predicate
+    // rather than by appendEvent happening to have no branch for them.
+    || event.kind === "budget_resolved"
+    || event.kind === "context_probe"
+    || event.kind === "context_window_conflict"
+    || event.kind === "calibration_sample"
+    || event.kind === "evidence_split";
+}
+
+function formatGraphStatsLines(
+  ev: Extract<RunEvent, { kind: "graph_stats" }>,
+  agentLogEnabled: boolean,
+): string[] {
+  if (!agentLogEnabled) {
+    // Compact form (unchanged behavior)
+    const preview = ev.seeds.slice(0, 3).join(", ");
+    const extra = ev.seeds.length > 3 ? `, …+${ev.seeds.length - 3}` : "";
+    const cacheHint = ev.fromCache ? " (cache hit)" : "";
+    const tag = ev.retrievalMode
+      ? ` · ${retrievalTag(ev.retrievalMode, ev.seedFallback ?? "none", ev.seedFallbackReason, ev.denseMax)}`
+      : "";
+    return [`Граф: ${ev.seeds.length} seeds [${preview}${extra}] → ${ev.expanded} / ${ev.total} страниц${cacheHint}${tag}`];
+  }
+
+  // Trace form — lines prefixed with "  " are indented items, others are sub-headers
+  const SEED_CAP = 5;
+  const cacheHint = ev.fromCache ? "  [cache hit]" : "";
+  const shown = ev.seeds.slice(0, SEED_CAP);
+  const remainder = ev.seeds.length - shown.length;
+  const seedParts = shown
+    .filter(id => (ev.seedScores[id] ?? 0) > 0)
+    .map(id => `${id} (${(ev.seedScores[id] ?? 0).toFixed(2)})`);
+  const totalSeeds = seedParts.length + remainder;
+  const lines: string[] = [`Seeds (${totalSeeds})${cacheHint}`];
+  for (const part of seedParts) lines.push(`  ${part}`);
+  if (remainder > 0) lines.push(`  …+${remainder}`);
+
+  if (ev.retrievalMode) {
+    lines.push(`Retrieval: ${retrievalTag(ev.retrievalMode, ev.seedFallback ?? "none", ev.seedFallbackReason, ev.denseMax)}`);
+  } else if (ev.seedFallback && ev.seedFallback !== "none") {
+    lines.push(`Seed fallback: ${ev.seedFallback}`);
+  }
+
+  if (ev.expandedPages.length > 0) {
+    lines.push(`BFS expanded (${ev.expandedPages.length}):`);
+    for (const id of ev.expandedPages) {
+      const score = ev.expandedScores[id];
+      lines.push(score !== undefined ? `  ${id} (${score.toFixed(2)})` : `  ${id}`);
+    }
+  }
+  if (ev.floorApplied) {
+    lines.push(`Floor: pruned ${ev.prunedCount ?? 0} (ref ${(ev.floorRef ?? 0).toFixed(2)})`);
+  } else if (ev.floorSkippedReason) {
+    lines.push(`Floor skipped: ${ev.floorSkippedReason}`);
+  }
+  return lines;
+}
+
+type ViewState = "idle" | "running" | "done" | "error" | "cancelled";
+
+function registerLinkHandler(el: HTMLElement, app: App): void {
+    el.addEventListener("click", (e) => {
+        const a = (e.target as HTMLElement).closest("a.internal-link");
+        if (!a) return;
+        e.preventDefault();
+        const href = a.getAttribute("data-href") ?? a.getAttribute("href") ?? "";
+        if (href) void app.workspace.openLinkText(href, "", false);
+    });
+}
+
+const PREVIEW_INLINE = 140;
+
+export class LlmWikiView extends ItemView {
+  private state: ViewState = "idle";
+  private stepsEl!: HTMLElement;
+  private finalEl!: HTMLElement;
+  private resultSection!: HTMLElement;
+  private resultToggle!: HTMLElement;
+  private resultOpen = false;
+  private historyEl!: HTMLElement;
+  private historySection!: HTMLElement;
+  private historyToggle!: HTMLElement;
+  private historyOpen = false;
+  private statusEl!: HTMLElement;
+  private progressToggle!: HTMLElement;
+  private progressCount!: HTMLElement;
+  private stepsOpen = true;
+  private stepsPinnedToBottom = true;
+  private stepsScrollBottomBtn!: HTMLButtonElement;
+  private cancelBtn!: HTMLButtonElement;
+  private queryInput!: HTMLTextAreaElement;
+  private askDomainBtn!: HTMLButtonElement;
+  private askWikiBtn!: HTMLButtonElement;
+  private domainSelect?: HTMLSelectElement;
+  private initBtn?: HTMLButtonElement;
+  private ingestBtn?: HTMLButtonElement;
+  private lintBtn?: HTMLButtonElement;
+  private formatBtn?: HTMLButtonElement;
+  private deleteBtn?: HTMLButtonElement;
+  private reinitBtn?: HTMLButtonElement;
+  private addSourceBtn?: HTMLButtonElement;
+  private openLogLink?: HTMLAnchorElement;
+  private openIndexLink?: HTMLAnchorElement;
+  private domains: DomainEntry[] = [];
+  private formatPreviewSection: HTMLElement | null = null;
+  private lastContext: { operation: WikiOperation; domainId: string | undefined; report: string } | null = null;
+  // Chat state
+  private chatSection: HTMLElement | null = null;
+  private chatMessagesEl: HTMLElement | null = null;
+  private chatInputEl: HTMLTextAreaElement | null = null;
+  private chatSendBtn: HTMLButtonElement | null = null;
+  private chatHistory: ChatMessage[] = [];
+  private chatToggle: HTMLElement | null = null;
+  private chatOpen = true;
+  private chatBodyEl: HTMLElement | null = null;
+  private currentChatBubble: HTMLElement | null = null;
+  private currentChatBuffer = "";
+  private chatTickHandle: number | null = null;
+  private chatStartTs = 0;
+  private lastUserMessage = "";
+  private lastRunId: string | null = null;
+  private ratingSection: HTMLElement | null = null;
+  private renderSeq = 0;
+  private startTs = 0;
+  private lastStepTs = 0;
+  private llmStats: Array<{ inputTokens?: number; outputTokens: number; ttftMs: number; llmDurationMs: number; }> = [];
+  private resultSpeedEl: HTMLElement | null = null;
+  private toolCount = 0;
+  private stepCount = 0;
+  private progressEl: HTMLElement | null = null;
+  private mobileWaitingEl: HTMLElement | null = null;
+  private progressTotal = 0;
+  private progressDone = 0;
+  private progressPhaseEl: HTMLElement | null = null;
+  private tickHandle: number | null = null;
+  private toolRenderFrames: ToolRenderFrame<HTMLElement>[] = [];
+  private reasoningBlock: HTMLElement | null = null;
+  private reasoningBuffer = "";
+  private reasoningRafHandle: number | null = null;
+  private llmLifecycleState: LlmLifecycleState = emptyLlmLifecycleState();
+  private llmLifecycleRows = new Map<string, HTMLElement>();
+  private llmLifecycleEvents = new Map<string, LlmLifecycleEvent>();
+  private llmWaitingTimers = new LlmLifecycleWaitingTimers<number>(
+    {
+      now: () => Date.now(),
+      setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+      clearTimeout: (handle) => window.clearTimeout(handle),
+    },
+    (id) => this.refreshLlmLifecycle(id),
+  );
+  private liveStatusSection: HTMLElement | null = null;
+  private liveStatusIconEl: HTMLElement | null = null;
+  private liveStatusTextEl: HTMLElement | null = null;
+  private queryStatsEl: HTMLElement | null = null;
+  private queryStatsTokensEl: HTMLElement | null = null;
+  private currentQueryStats: Extract<RunEvent, { kind: "query_stats" }> | null = null;
+  private currentQueryStatsInputTokens: number | null = null;
+  private showingStoredResultDuringRun = false;
+
+  constructor(leaf: WorkspaceLeaf, private plugin: LlmWikiPlugin) {
+    super(leaf);
+  }
+
+  getViewType(): string { return AI_WIKI_VIEW_TYPE; }
+  getDisplayText(): string { return AI_WIKI_DISPLAY_NAME; }
+  getIcon(): string { return "brain-circuit"; }
+
+  async onOpen(): Promise<void> {
+    const root = this.containerEl.children[1];
+    root.empty();
+    root.addClass("ai-wiki-view");
+
+    const T = i18n();
+    const isMobile = Platform.isMobile;
+
+    const header = root.createDiv("ai-wiki-header");
+    header.createEl("h3", { text: "AI wiki" });
+    this.statusEl = header.createDiv("ai-wiki-status");
+
+    // На mobile доступна только query-операция (см. types.ts/main.ts gating).
+    // Скрываем секции "Создание домена" и "Наполнение/Актуализация" целиком —
+    // их кнопки (init/ingest/lint/format) не работают.
+    if (!isMobile) {
+      // 1. Создание нового домена
+      root.createDiv({ cls: "ai-wiki-section-label", text: T.view.sectionCreate });
+      const createRow = root.createDiv("ai-wiki-create-row");
+      this.initBtn = createRow.createEl("button", { text: T.view.init, cls: "ai-wiki-init-btn" });
+      this.initBtn.addEventListener("click", () => this.openAddDomain());
+
+      // 2+3. Наполнение / Актуализация
+      root.createDiv({ cls: "ai-wiki-section-label", text: T.view.sectionDomain });
+      this.buildDomainRow(root as HTMLElement, { withActions: true });
+    } else {
+      root.createDiv({ cls: "ai-wiki-section-label", text: T.view.sectionDomainMobile });
+      this.buildDomainRow(root as HTMLElement, { withActions: false });
+      const mobileActions = root.createDiv("ai-wiki-domain-actions");
+      this.formatBtn = mobileActions.createEl("button", { text: T.view.format });
+      this.formatBtn.addEventListener("click", () => void this.plugin.controller.format());
+      this.deleteBtn = mobileActions.createEl("button", { text: T.view.delete });
+      this.deleteBtn.addEventListener("click", () => {
+        const file = this.plugin.app.workspace.getActiveFile();
+        const domainId = this.domainSelect?.value;
+        if (file && domainId) void this.plugin.controller.deleteSource(domainId, file.path);
+      });
+    }
+
+    // 4. Запрос
+    root.createDiv({ cls: "ai-wiki-section-label", text: T.view.sectionQuery });
+    const ask = root.createDiv("ai-wiki-ask");
+    this.queryInput = ask.createEl("textarea", {
+      cls: "ai-wiki-query-input",
+      attr: { placeholder: "Question…", rows: "3" },
+    });
+
+    const askRow = ask.createDiv("ai-wiki-ask-row");
+    this.cancelBtn = askRow.createEl("button", { text: T.view.cancel, cls: "mod-warning" });
+    const askButtons = askRow.createDiv("ai-wiki-ask-buttons");
+    this.askWikiBtn = askButtons.createEl("button", { text: T.view.askWiki });
+    this.askDomainBtn = askButtons.createEl("button", { text: T.view.askDomain, cls: "mod-cta" });
+    this.cancelBtn.disabled = true;
+    this.askDomainBtn.addEventListener("click", () => {
+      const d = this.domainSelect?.value;
+      if (!d) { new Notice(i18n().view.enterQuestion); return; }
+      this.submitQuery(d);
+    });
+    this.askWikiBtn.addEventListener("click", () => {
+      const T2 = i18n().view;
+      new ConfirmModal(this.app, T2.askWikiConfirmTitle, [T2.askWikiConfirmBody], () => this.submitQuery("*")).open();
+    });
+    this.cancelBtn.addEventListener("click", () => this.plugin.controller.cancelCurrent());
+
+    const progressHeader = root.createDiv("ai-wiki-progress-header");
+    const progressH4 = progressHeader.createEl("h4", { cls: "ai-wiki-progress-title" });
+    this.progressToggle = progressH4.createSpan({ cls: "ai-wiki-progress-arrow", text: "▶" });
+    progressH4.appendText(" Progress ");
+    this.progressCount = progressH4.createSpan({ cls: "ai-wiki-progress-count muted", text: "" });
+    progressHeader.addEventListener("click", () => this.toggleSteps());
+
+    this.stepsEl = root.createDiv("ai-wiki-steps");
+    this.stepsEl.addClass("ai-wiki-hidden");
+    this.stepsEl.addEventListener("scroll", () => {
+      this.stepsPinnedToBottom = this.isStepsScrolledToBottom();
+      this.syncStepsScrollButton();
+    });
+    this.stepsScrollBottomBtn = root.createEl("button", {
+      text: T.view.scrollProgressBottom,
+      cls: "ai-wiki-scroll-bottom ai-wiki-hidden",
+      attr: { title: T.view.scrollProgressBottom, "aria-label": T.view.scrollProgressBottom },
+    });
+    this.stepsScrollBottomBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.stepsPinnedToBottom = true;
+      this.stepsEl.scrollTop = this.stepsEl.scrollHeight;
+      this.syncStepsScrollButton();
+    });
+
+    this.liveStatusSection = root.createDiv("ai-wiki-live-status ai-wiki-hidden");
+    this.liveStatusIconEl = this.liveStatusSection.createSpan("ai-wiki-live-status-icon");
+    this.liveStatusTextEl = this.liveStatusSection.createSpan("ai-wiki-live-status-text");
+
+    this.resultSection = root.createDiv("ai-wiki-result-section ai-wiki-hidden");
+    const resultHeader = this.resultSection.createDiv("ai-wiki-progress-header");
+    const resultH4 = resultHeader.createEl("h4", { cls: "ai-wiki-progress-title" });
+    this.resultToggle = resultH4.createSpan({ cls: "ai-wiki-progress-arrow", text: "▶" });
+    resultH4.appendText(` ${T.view.result}`);
+    this.resultSpeedEl = resultH4.createSpan({ cls: "muted ai-wiki-result-speed" });
+    resultHeader.addEventListener("click", () => this.toggleResult());
+    this.finalEl = this.resultSection.createDiv("ai-wiki-final ai-wiki-hidden");
+    registerLinkHandler(this.finalEl, this.app);
+
+    this.historySection = root.createDiv("ai-wiki-history-section ai-wiki-hidden");
+    const historyHeader = this.historySection.createDiv("ai-wiki-progress-header");
+    const historyH4 = historyHeader.createEl("h4", { cls: "ai-wiki-progress-title" });
+    this.historyToggle = historyH4.createSpan({ cls: "ai-wiki-progress-arrow", text: "▶" });
+    historyH4.appendText(` ${T.view.history}`);
+    historyHeader.addEventListener("click", () => this.toggleHistory());
+    this.historyEl = this.historySection.createDiv("ai-wiki-history ai-wiki-hidden");
+    this.renderHistory();
+
+    const ongoing = this.plugin.controller.currentOp;
+    if (ongoing) {
+      this.setRunning(ongoing.op, ongoing.args);
+    }
+  }
+
+  async onClose(): Promise<void> {
+    if (this.tickHandle !== null) window.clearTimeout(this.tickHandle);
+    if (this.chatTickHandle !== null) window.clearTimeout(this.chatTickHandle);
+    this.llmWaitingTimers.clearAll();
+    if (this.reasoningRafHandle !== null) {
+      window.cancelAnimationFrame(this.reasoningRafHandle);
+      this.reasoningRafHandle = null;
+    }
+    this.liveStatusSection = null;
+    this.liveStatusIconEl = null;
+    this.liveStatusTextEl = null;
+    if (this.plugin.controller.isBusy()) {
+      new BusyCloseModal(this.app, () => this.plugin.controller.cancelCurrent()).open();
+    }
+  }
+
+  private buildDomainRow(parent: HTMLElement, opts: { withActions: boolean }): void {
+    const T = i18n();
+    const domainBox = parent.createDiv("ai-wiki-domain");
+    const domainRow = domainBox.createDiv("ai-wiki-domain-row");
+    domainRow.createSpan({ cls: "muted", text: "Domain:" });
+    this.domainSelect = domainRow.createEl("select", { cls: "ai-wiki-domain-select" });
+    const refreshBtn = domainRow.createEl("button", { text: "↻", attr: { title: T.view.refreshTitle } });
+    refreshBtn.addEventListener("click", () => void this.refreshDomains());
+    this.domainSelect.addEventListener("change", () => {
+      void this.plugin.localConfigStore.save({ lastDomain: this.domainSelect!.value });
+      this.updateButtonAvailability();
+    });
+
+    if (opts.withActions) {
+      this.addSourceBtn = domainRow.createEl("button", { attr: { title: T.view.addSourceTitle } });
+      setIcon(this.addSourceBtn, "folder-plus");
+      this.addSourceBtn.disabled = true;
+      this.addSourceBtn.addEventListener("click", () => void this.openManageSources());
+      this.reinitBtn = domainRow.createEl("button", { attr: { title: T.view.reinitTitle } });
+      setIcon(this.reinitBtn, "recycle");
+      this.reinitBtn.disabled = true;
+      this.reinitBtn.addEventListener("click", () => void this.runReinit());
+
+      this.openLogLink = domainRow.createEl("a", {
+        cls: "internal-link ai-wiki-domain-file-link",
+        attr: { title: "Open _log.md", "data-href": "" },
+      });
+      setIcon(this.openLogLink, "scroll-text");
+
+      this.openIndexLink = domainRow.createEl("a", {
+        cls: "internal-link ai-wiki-domain-file-link",
+        attr: { title: "Open _index.md", "data-href": "" },
+      });
+      setIcon(this.openIndexLink, "list");
+
+      domainRow.addEventListener("click", (e) => {
+        const a = (e.target as HTMLElement).closest("a.ai-wiki-domain-file-link");
+        if (!a) return;
+        e.preventDefault();
+        const href = a.getAttribute("data-href") ?? "";
+        if (!href) return;
+        void (async () => {
+          let f = this.app.vault.getAbstractFileByPath(href);
+          if (!f && await this.app.vault.adapter.exists(href)) {
+            const content = await this.app.vault.adapter.read(href);
+            // Ensure parent folder is in vault index before vault.create()
+            const parentPath = href.substring(0, href.lastIndexOf("/"));
+            if (!this.app.vault.getAbstractFileByPath(parentPath)) {
+              try { await this.app.vault.createFolder(parentPath); } catch { /* EEXIST OK */ }
+            }
+            try {
+              f = await this.app.vault.create(href, content);
+              if (!f) f = this.app.vault.getAbstractFileByPath(href);
+            } catch {
+              f = this.app.vault.getAbstractFileByPath(href);
+            }
+            if (!f) {
+              // vault indexing failed — show content in modal
+              new FileContentModal(this.app, href, content).open();
+              return;
+            }
+          }
+          if (f) {
+            // Extract filename and domain folder for workspace.openLinkText
+            const filename = href.split("/").pop() ?? href;
+            const domainFolder = href.substring(0, href.lastIndexOf("/"));
+            void this.app.workspace.openLinkText(filename, domainFolder, false);
+          } else {
+            const isLog = href.endsWith("log.jsonl");
+            new Notice(isLog ? "log.jsonl not found — run ingest or lint first." : "index.jsonl not found — run init first.");
+          }
+        })();
+      });
+
+      const updateDomainLinks = () => {
+        const d = this.domains.find((x) => x.id === this.domainSelect!.value);
+        const wikiFolder = d ? domainWikiFolder(d.wiki_folder) : "";
+        const logPath = d ? domainLogPath(wikiFolder) : "";
+        const indexPath = d ? domainIndexPath(wikiFolder) : "";
+        if (this.openLogLink) {
+          this.openLogLink.setAttribute("data-href", logPath);
+          this.openLogLink.toggleClass("is-unresolved", !d);
+        }
+        if (this.openIndexLink) {
+          this.openIndexLink.setAttribute("data-href", indexPath);
+          this.openIndexLink.toggleClass("is-unresolved", !d);
+        }
+        if (this.reinitBtn) this.reinitBtn.disabled = !d;
+        if (this.addSourceBtn) this.addSourceBtn.disabled = !d;
+      };
+
+      this.domainSelect.addEventListener("change", updateDomainLinks);
+
+      const actionRow = domainBox.createDiv("ai-wiki-domain-actions");
+      this.ingestBtn = actionRow.createEl("button", { text: T.view.ingest });
+      this.lintBtn = actionRow.createEl("button", { text: T.view.lint });
+      this.formatBtn = actionRow.createEl("button", { text: T.view.format });
+      this.formatBtn.addEventListener("click", () => void this.plugin.controller.format());
+      this.deleteBtn = actionRow.createEl("button", { text: T.view.delete });
+      this.deleteBtn.addEventListener("click", () => {
+        const file = this.plugin.app.workspace.getActiveFile();
+        const domainId = this.domainSelect?.value;
+        if (file && domainId) void this.plugin.controller.deleteSource(domainId, file.path);
+      });
+      this.ingestBtn.addEventListener("click", () => {
+        const file = this.plugin.app.workspace.getActiveFile();
+        if (!file) { new Notice(i18n().view.noActiveFile); return; }
+        const domainId = this.domainSelect!.value || undefined;
+        new ConfirmModal(this.plugin.app, "Ingest — confirm", [
+          `File: ${file.name}`,
+          "AI Wiki will read the file, extract entities and update domain wiki pages.",
+        ], () => void this.plugin.controller.ingestActive(domainId)).open();
+      });
+      this.lintBtn.addEventListener("click", () => {
+        const domainEntry = this.domains.find(d => d.id === this.domainSelect!.value);
+        if (!domainEntry) return;
+
+        const counts = new Map<string, number>();
+        const allMd = this.plugin.app.vault.getMarkdownFiles();
+        for (const et of domainEntry.entity_types ?? []) {
+          const prefix = `${domainWikiFolder(domainEntry.wiki_folder)}/${effectiveSubfolder(et)}/`;
+          counts.set(et.type, allMd.filter(f => f.path.startsWith(prefix)).length);
+        }
+
+        new LintOptionsModal(
+          this.plugin.app,
+          domainEntry,
+          this.plugin.settings.lintOptions.useLlm,
+          counts,
+          (opts) => void this.plugin.controller.lint(domainEntry.id, opts),
+        ).open();
+      });
+    }
+
+    this.registerEvent(
+      this.plugin.app.workspace.on("file-open", () => this.updateButtonAvailability()),
+    );
+    void this.refreshDomains();
+  }
+
+  private updateButtonAvailability(): void {
+    const hasDomain = !!(this.domainSelect?.value);
+    const isRunning = this.state === "running";
+    const activeFile = this.plugin.app.workspace.getActiveFile();
+    const domain = this.domains.find((d) => d.id === this.domainSelect?.value);
+    const isSource = !!activeFile && !!domain && isSourceFile(activeFile.path, domain);
+    const onWikiArticle = !!activeFile && isWikiArticlePath(activeFile.path);
+    const canFormat = !!activeFile && activeFile.extension === "md"
+      && !isWikiArticlePath(activeFile.path);
+
+    if (this.askDomainBtn) this.askDomainBtn.disabled = isRunning || !hasDomain;
+    if (this.askWikiBtn)   this.askWikiBtn.disabled   = isRunning;
+    if (this.ingestBtn)    this.ingestBtn.disabled    = !hasDomain || onWikiArticle;
+    if (this.lintBtn)      this.lintBtn.disabled      = !hasDomain;
+    if (this.formatBtn)    this.formatBtn.disabled    = !canFormat;
+    if (this.deleteBtn)    this.deleteBtn.disabled    = !isSource;
+    if (this.reinitBtn)    this.reinitBtn.disabled    = !hasDomain;
+    if (this.addSourceBtn) this.addSourceBtn.disabled = !hasDomain;
+  }
+
+  private async refreshDomains(): Promise<void> {
+    if (!this.domainSelect) return;
+    let domains: DomainEntry[];
+    try { domains = await this.plugin.controller.loadDomains(); } catch { return; }
+    this.domains = domains;
+    const previous = this.domainSelect.value;
+    this.domainSelect.empty();
+    const allOpt = this.domainSelect.createEl("option", { value: "", text: i18n().view.allDomains });
+    void allOpt;
+    for (const d of domains) {
+      this.domainSelect.createEl("option", { value: d.id, text: d.name || d.id });
+    }
+    const restoreTarget = previous || (await this.plugin.localConfigStore.load()).lastDomain;
+    if (restoreTarget && Array.from(this.domainSelect.options).some((o) => o.value === restoreTarget)) {
+      this.domainSelect.value = restoreTarget;
+    }
+    if (this.reinitBtn) this.reinitBtn.disabled = !this.domainSelect.value;
+    if (this.addSourceBtn) this.addSourceBtn.disabled = !this.domainSelect.value;
+    // trigger link update
+    this.domainSelect.dispatchEvent(new Event("change"));
+  }
+
+  private openAddDomain(): void {
+    const cwd = this.plugin.controller.cwdOrEmpty();
+    if (!cwd) { new Notice(i18n().view.cwdNotSet); return; }
+    new AddDomainModal(this.app, (input) => {
+      const T = i18n().modal;
+      const mdFiles = input.sourcePaths.length
+        ? collectMdInPaths(this.app.vault, input.sourcePaths)
+        : [];
+
+      new ConfirmModal(
+        this.app,
+        T.initConfirmTitle,
+        [T.initConfirmBody(mdFiles.length, input.sourcePaths.length)],
+        () => void (async () => {
+          const r = await this.plugin.controller.registerDomain(input);
+          if (!r.ok) return;
+          await this.refreshDomains();
+          if (this.domainSelect) {
+            this.domainSelect.value = input.id;
+            this.domainSelect.dispatchEvent(new Event("change"));
+          }
+          void this.plugin.controller.init(
+            input.id,
+            false,
+            input.sourcePaths.length ? input.sourcePaths : undefined,
+          );
+        })(),
+      ).open();
+    }).open();
+  }
+
+  private async runReinit(): Promise<void> {
+    if (!this.domainSelect) return;
+    const domainId = this.domainSelect.value;
+    if (!domainId) return;
+
+    let entry: DomainEntry | undefined;
+    try {
+      const domains = await this.plugin.controller.loadDomains();
+      entry = domains.find((d) => d.id === domainId);
+    } catch {
+      return;
+    }
+    if (!entry) return;
+    const resolved = entry;
+
+    const sourcePaths = resolved.source_paths ?? [];
+    if (sourcePaths.length === 0) {
+      new Notice(i18n().view.reinitNoSources);
+      return;
+    }
+
+    const plan = await this.plugin.controller.computeIncrementalPlan(resolved.id);
+    new ReinitModeModal(this.app, plan, (mode) => {
+      if (mode === "full") {
+        void this.plugin.controller.init(resolved.id, false, sourcePaths, true);
+      } else {
+        void this.plugin.controller.init(resolved.id, false, plan.changed, false, true);
+      }
+    }).open();
+  }
+
+  private async openManageSources(): Promise<void> {
+    const domainId = this.domainSelect!.value;
+    if (!domainId) return;
+    const domains = await this.plugin.controller.loadDomains();
+    const entry = domains.find((d) => d.id === domainId);
+    if (!entry) return;
+    new ManageSourcesModal(this.app, entry, (result) => {
+      void this.handleManageSourcesResult(entry, result);
+    }).open();
+  }
+
+  private async handleManageSourcesResult(
+    original: DomainEntry,
+    result: { sourcePaths: string[] },
+  ): Promise<void> {
+    const oldPaths = original.source_paths ?? [];
+    const newPaths = result.sourcePaths;
+    const added = newPaths.filter((p) => !oldPaths.includes(p));
+    const removed = oldPaths.filter((p) => !newPaths.includes(p));
+
+    if (removed.length > 0 && newPaths.length > 0) {
+      const T = i18n().modal;
+      const base = this.plugin.controller.cwdOrEmpty();
+      const toVaultRel = (p: string): string => {
+        if (!base || !isAbsolute(p)) return p;
+        const rel = relative(base, p);
+        return rel.startsWith("..") ? p : rel;
+      };
+      const mdFiles = collectMdInPaths(this.app.vault, newPaths.map(toVaultRel));
+      const wikiFiles = collectMdInPaths(this.app.vault, [domainWikiFolder(original.wiki_folder)]);
+      const body = T.reinitConfirmBody(original.id, wikiFiles.length, mdFiles.length, newPaths.length);
+      new ConfirmModal(
+        this.app,
+        T.reinitConfirmTitle,
+        [body],
+        async () => {
+          await this.plugin.controller.updateDomainSources(original.id, newPaths);
+          const deleted = await this.plugin.controller.cleanupRemovedSources(original.id, removed);
+          if (deleted > 0) new Notice(`Удалено статей: ${deleted}`);
+          void this.plugin.controller.init(original.id, false, newPaths, true);
+        },
+      ).open();
+      return;
+    }
+
+    if (removed.length > 0) {
+      await this.plugin.controller.updateDomainSources(original.id, newPaths);
+      const deleted = await this.plugin.controller.cleanupRemovedSources(original.id, removed);
+      if (deleted > 0) new Notice(`Удалено статей: ${deleted}`);
+      return;
+    }
+
+    if (added.length > 0) {
+      await this.plugin.controller.updateDomainSources(original.id, newPaths);
+      new IngestScopeModal(this.app, added.length, newPaths.length, (scope) => {
+        if (scope === "skip") return;
+        const paths = scope === "new" ? added : newPaths;
+        void this.plugin.controller.init(original.id, false, paths);
+      }).open();
+    }
+  }
+
+  private submitQuery(domainArg: string): void {
+    const q = this.queryInput.value.trim();
+    if (!q) { new Notice(i18n().view.enterQuestion); return; }
+    if (this.state === "running") { new Notice(i18n().view.operationInProgress); return; }
+    void this.plugin.controller.query(q, domainArg);
+    this.queryInput.value = "";
+  }
+
+  setRunning(operation: WikiOperation, args: string[]): void {
+    this.llmWaitingTimers.clearAll();
+    this.state = "running";
+    this.stepsEl.empty();
+    this.finalEl.empty();
+    this.statusEl.setText(`▶ ${operation} ${args.join(" ")}`);
+    this.cancelBtn.disabled = false;
+    this.askDomainBtn.disabled = true;
+    this.askWikiBtn.disabled = true;
+    if (this.initBtn) this.initBtn.disabled = true;
+    if (this.ingestBtn) this.ingestBtn.disabled = true;
+    if (this.lintBtn) this.lintBtn.disabled = true;
+    if (this.formatBtn) this.formatBtn.disabled = true;
+    if (this.deleteBtn) this.deleteBtn.disabled = true;
+    if (this.reinitBtn) this.reinitBtn.disabled = true;
+    if (this.addSourceBtn) this.addSourceBtn.disabled = true;
+    this.chatSection?.remove();
+    this.chatSection = null;
+    this.ratingSection?.remove();
+    this.ratingSection = null;
+    this.formatPreviewSection?.remove();
+    this.formatPreviewSection = null;
+    this.lastContext = null;
+    this.chatHistory = [];
+
+    this.resultSection.addClass("ai-wiki-hidden");
+    this.resetQueryStats();
+    this.showingStoredResultDuringRun = false;
+    this.finalEl.empty();
+    this.resultOpen = false;
+
+    this.startTs = Date.now();
+    this.lastStepTs = this.startTs;
+    this.toolCount = 0;
+    this.stepCount = 0;
+    this.progressEl = null;
+    this.mobileWaitingEl = null;
+    this.progressPhaseEl = null;
+    this.progressTotal = 0;
+    this.progressDone = 0;
+    this.toolRenderFrames = [];
+    this.llmLifecycleState = emptyLlmLifecycleState();
+    this.llmLifecycleRows.clear();
+    this.llmLifecycleEvents.clear();
+    this.reasoningBlock = null;
+    this.reasoningBuffer = "";
+    if (this.reasoningRafHandle !== null) {
+      window.cancelAnimationFrame(this.reasoningRafHandle);
+      this.reasoningRafHandle = null;
+    }
+    this.llmStats = [];
+    this.resultSpeedEl?.setText("");
+    this.stepsOpen = true;
+    this.stepsPinnedToBottom = true;
+    this.stepsEl.removeClass("ai-wiki-hidden");
+    this.syncStepsScrollButton();
+    this.progressToggle.setText("▼");
+    this.updateMetrics();
+    if (this.tickHandle !== null) { window.clearTimeout(this.tickHandle); this.tickHandle = null; }
+    this.liveStatusSection?.removeClass("ai-wiki-hidden");
+    this.liveStatusIconEl?.setText("");
+    this.liveStatusTextEl?.setText("");
+    this.scheduleMetricsTick();
+    if (Platform.isMobile) {
+      // Streaming недоступен на mobile — показываем спиннер, чтобы UI не выглядел замёрзшим.
+      const placeholder = this.stepsEl.createDiv("ai-wiki-step ai-wiki-step-pending");
+      placeholder.setText(i18n().view.mobileWaiting);
+      this.mobileWaitingEl = placeholder;
+    }
+  }
+
+  appendEvent(ev: RunEvent): void {
+    if (isTelemetryOnlyRunEvent(ev)) return;
+    if (this.mobileWaitingEl) {
+      this.mobileWaitingEl.remove();
+      this.mobileWaitingEl = null;
+    }
+    if (ev.kind === "format_preview") {
+      this.renderFormatPreview(ev.tempPath, ev.report, ev.missingTokens, ev.runId, ev.visionCount);
+      return;
+    }
+    if (ev.kind === "format_applied" || ev.kind === "format_cancelled") {
+      this.formatPreviewSection?.remove();
+      this.formatPreviewSection = null;
+      return;
+    }
+    if (ev.kind === "init_start") {
+      this.progressTotal = ev.totalFiles;
+      this.progressDone = 0;
+      if (this.progressEl) {
+        // Second init_start (Phase 2) — reset existing elements in place
+        this.progressEl.setText(`0 / ${ev.totalFiles} файлов`);
+        if (this.progressPhaseEl) {
+          const label = ev.phase === "ingest"
+            ? i18nFor(resolveLang(this.plugin.settings.outputLanguage)).view.ingestingFiles
+            : i18nFor(resolveLang(this.plugin.settings.outputLanguage)).view.analysingFiles;
+          this.progressPhaseEl.setText(label);
+        }
+      } else {
+        const step = this.stepsEl.createDiv("ai-wiki-step ai-wiki-progress");
+        step.createSpan({ cls: "ai-wiki-step-icon" }).setText("📂");
+        const label = ev.phase === "ingest"
+          ? i18nFor(resolveLang(this.plugin.settings.outputLanguage)).view.ingestingFiles
+          : i18nFor(resolveLang(this.plugin.settings.outputLanguage)).view.analysingFiles;
+        this.progressPhaseEl = step.createSpan({ cls: "ai-wiki-progress-phase" });
+        this.progressPhaseEl.setText(label);
+        this.progressEl = step.createSpan({ cls: "ai-wiki-progress-text" });
+        this.progressEl.setText(`0 / ${ev.totalFiles} файлов`);
+      }
+      this.scrollSteps();
+      return;
+    }
+    if (ev.kind === "file_start") {
+      if (this.progressEl) {
+        this.progressEl.setText(`${ev.index} / ${ev.total} файлов → ${ev.file.split("/").pop()}`);
+      }
+      this.scrollSteps();
+      return;
+    }
+    if (ev.kind === "file_done") {
+      this.progressDone++;
+      if (this.progressEl) {
+        this.progressEl.setText(`${this.progressDone} / ${this.progressTotal} файлов`);
+      }
+      this.scrollSteps();
+      return;
+    }
+    if (ev.kind === "graph_stats") {
+      const agentLogEnabled = this.plugin.settings.agentLogEnabled;
+      const lines = formatGraphStatsLines(ev, agentLogEnabled);
+      const step = this.stepsEl.createDiv("ai-wiki-step");
+      const graphHead = step.createDiv("ai-wiki-step-head");
+      graphHead.createSpan({ cls: "ai-wiki-step-icon" }).setText("🌐");
+      graphHead.createSpan({ cls: "ai-wiki-step-name" }).setText(lines[0]);
+      graphHead.createSpan({ cls: "ai-wiki-step-time muted" }).setText(this.elapsedShort());
+      if (agentLogEnabled && lines.length > 1) {
+        const detail = step.createDiv("ai-wiki-step-detail");
+        for (const line of lines.slice(1)) {
+          const d = detail.createDiv();
+          if (line.startsWith("  ")) {
+            d.addClass("ai-wiki-step-detail-item");
+            d.setText(line.trimStart());
+          } else {
+            d.addClass("ai-wiki-step-detail-header");
+            d.setText(line);
+          }
+        }
+      }
+      this.scrollSteps();
+      return;
+    }
+    if (ev.kind === "domain_created") {
+      void this.refreshDomains();
+      return;
+    }
+    if (ev.kind === "source_path_added") return;
+    if (ev.kind === "domain_updated") { void this.refreshDomains(); return; }
+    if (ev.kind === "query_stats") { this.renderQueryStats(ev); return; }
+    if (ev.kind === "llm_call_stats") {
+      this.llmStats.push(ev);
+      if (ev.inputTokens !== undefined) this.fillQueryStatsTokens(ev.inputTokens);
+      return;
+    }
+    if (ev.kind === "llm_lifecycle") {
+      this.renderLlmLifecycle(ev);
+      this.stepCount++;
+      this.updateMetrics();
+      return;
+    }
+    if (ev.kind === "transport_retry_scheduled") {
+      this.stepCount++;
+      const labels = i18nFor(resolveUiLang()).view;
+      const failedAttempt = ev.attempt + 1;
+      const totalAttempts = ev.maxRetries + 1;
+      const reasonParts = [
+        ev.errorClass || "transport",
+        ev.status === undefined ? undefined : labels.transportRetryHttpStatus(ev.status),
+        labels.transportRetryAttempt(failedAttempt, totalAttempts),
+        ev.delayMs === undefined ? undefined : labels.transportRetryDelay(ev.delayMs),
+      ].filter((part): part is string => !!part);
+      const reason = reasonParts.join(" · ");
+      const step = this.stepsEl.createDiv("ai-wiki-step");
+      const head = step.createDiv("ai-wiki-step-head");
+      head.createSpan({ cls: "ai-wiki-step-icon" }).setText("↻");
+      head.createSpan({ cls: "ai-wiki-step-name" }).setText(labels.transportRetry);
+      head.createSpan({ cls: "ai-wiki-step-arg" }).setText(reason);
+      head.createSpan({ cls: "ai-wiki-step-time muted" }).setText(this.elapsedShort());
+      this.liveStatusIconEl?.setText("↻");
+      this.liveStatusTextEl?.setText(`${labels.transportRetry}: ${reason}`);
+      this.updateMetrics();
+      this.scrollSteps();
+      return;
+    }
+    if (ev.kind === "structural_error" && ev.succeeded !== true) {
+      this.stepCount++;
+      const labels = i18nFor(resolveUiLang()).view;
+      const safeMessage = ev.message.replace(/\s+/g, " ").trim().slice(0, 240) || ev.errorType;
+      const reason = [
+        ...(ev.errorType === "schema_validate" ? [labels.structuralRetry] : []),
+        safeMessage,
+        labels.structuralRetryType(ev.errorType),
+        labels.structuralRetryAttempt(ev.retryAttempt + 1),
+      ].join(" · ");
+      const statusLabel = ev.errorType === "schema_validate"
+        ? labels.domainRejected
+        : labels.structuralRetry;
+      const step = this.stepsEl.createDiv("ai-wiki-step");
+      const head = step.createDiv("ai-wiki-step-head");
+      head.createSpan({ cls: "ai-wiki-step-icon" }).setText("↻");
+      head.createSpan({ cls: "ai-wiki-step-name" }).setText(statusLabel);
+      head.createSpan({ cls: "ai-wiki-step-arg" }).setText(reason);
+      head.createSpan({ cls: "ai-wiki-step-time muted" }).setText(this.elapsedShort());
+      this.liveStatusIconEl?.setText("↻");
+      this.liveStatusTextEl?.setText(`${statusLabel}: ${reason}`);
+      this.updateMetrics();
+      this.scrollSteps();
+      return;
+    }
+    if (ev.kind === "structured_validation_retry") {
+      this.stepCount++;
+      const labels = i18nFor(resolveUiLang()).view;
+      const nextLabel = labels[`validationRetryNext_${ev.nextAction}`];
+      const step = this.stepsEl.createDiv("ai-wiki-step");
+      const head = step.createDiv("ai-wiki-step-head");
+      head.createSpan({ cls: "ai-wiki-step-icon" }).setText("↻");
+      head.createSpan({ cls: "ai-wiki-step-name" }).setText(labels.validationRetry);
+      head.createSpan({ cls: "ai-wiki-step-arg" }).setText(`${ev.safeReason} · ${nextLabel}`);
+      head.createSpan({ cls: "ai-wiki-step-time muted" }).setText(this.elapsedShort());
+      this.liveStatusIconEl?.setText("↻");
+      this.liveStatusTextEl?.setText(`${labels.validationRetry}: ${ev.safeReason}`);
+      this.updateMetrics();
+      this.scrollSteps();
+      return;
+    }
+    if (ev.kind === "tool_use" && shouldSuppressLegacyLlmTool(ev.name, this.llmLifecycleState)) {
+      this.toolRenderFrames = pushToolRenderFrame(this.toolRenderFrames, {
+        step: null,
+        startedAt: Date.now(),
+      });
+      return;
+    }
+    if (ev.kind !== "assistant_text") this.stepCount++;
+    if (ev.kind === "tool_use") {
+      this.toolCount++;
+      this.reasoningBlock = null;
+      this.reasoningBuffer = "";
+      if (this.reasoningRafHandle !== null) {
+        window.cancelAnimationFrame(this.reasoningRafHandle);
+        this.reasoningRafHandle = null;
+      }
+      const step = this.stepsEl.createDiv("ai-wiki-step");
+      const head = step.createDiv("ai-wiki-step-head");
+      head.createSpan({ cls: "ai-wiki-step-icon" }).setText("🔧");
+      head.createSpan({ cls: "ai-wiki-step-name" }).setText(ev.name);
+      const summary = summariseInput(ev.input);
+      if (summary) head.createSpan({ cls: "ai-wiki-step-arg" }).setText(summary);
+      head.createSpan({ cls: "ai-wiki-step-time muted" }).setText(this.elapsedShort());
+      this.toolRenderFrames = pushToolRenderFrame(this.toolRenderFrames, {
+        step,
+        startedAt: Date.now(),
+      });
+      this.scrollSteps();
+      this.liveStatusIconEl?.setText("🔧");
+      this.liveStatusTextEl?.setText(`${ev.name}  ${summariseInput(ev.input)}`);
+    } else if (ev.kind === "tool_result") {
+      const popped = popToolRenderFrame(this.toolRenderFrames);
+      this.toolRenderFrames = popped.frames;
+      const frame = popped.frame;
+      const step = frame?.step;
+      if (step) {
+        const head = step.querySelector(".ai-wiki-step-head");
+        head?.addClass(ev.ok ? "ok" : "err");
+        const dur = ((Date.now() - frame.startedAt) / 1000).toFixed(1);
+        const t = step.querySelector(".ai-wiki-step-time");
+        if (t) t.setText(`${dur}s`);
+        if (ev.preview) {
+          const p = step.createDiv("ai-wiki-step-preview");
+          p.setText(truncate(ev.preview.replace(/\s+/g, " "), PREVIEW_INLINE));
+        }
+      }
+    } else if (ev.kind === "ask_user") {
+      const el = this.stepsEl.createDiv("ai-wiki-step ai-wiki-step--ask");
+      el.createSpan({ text: "⏳ Waiting for answer…" });
+      return;
+    } else if (ev.kind === "assistant_replace") {
+      // query.ts corrects answer in-place before emitting result event —
+      // no live markdown block exists for non-chat query, so no-op here.
+    } else if (ev.kind === "assistant_text") {
+      if (ev.isReasoning) {
+        if (!this.reasoningBlock) {
+          this.reasoningBlock = this.stepsEl.createDiv("ai-wiki-step reasoning");
+          const rHead = this.reasoningBlock.createDiv("ai-wiki-step-head");
+          rHead.createSpan({ cls: "ai-wiki-step-icon" }).setText("🧠");
+          rHead.createSpan({ cls: "ai-wiki-step-name muted" }).setText(i18n().view.analysing);
+          rHead.createSpan({ cls: "ai-wiki-step-time muted" }).setText(this.elapsedShort());
+          this.reasoningBlock.createSpan({ cls: "ai-wiki-reasoning-text" });
+        }
+        this.reasoningBuffer += ev.delta;
+        if (!this.reasoningRafHandle) {
+          this.reasoningRafHandle = window.requestAnimationFrame(() => {
+            this.reasoningRafHandle = null;
+            const span = this.reasoningBlock?.querySelector<HTMLElement>(".ai-wiki-reasoning-text");
+            if (span) span.setText(this.reasoningBuffer);
+            this.scrollSteps();
+          });
+        }
+        this.liveStatusIconEl?.setText("🧠");
+        this.liveStatusTextEl?.setText(i18nFor(resolveLang(this.plugin.settings.outputLanguage)).view.analysing);
+      } else {
+        this.liveStatusIconEl?.setText("💬");
+        this.liveStatusTextEl?.setText(i18nFor(resolveLang(this.plugin.settings.outputLanguage)).view.formingResponse);
+      }
+    } else if (ev.kind === "info_text") {
+      const step = this.stepsEl.createDiv("ai-wiki-step");
+      const head = step.createDiv("ai-wiki-step-head");
+      head.createSpan({ cls: "ai-wiki-step-icon" }).setText(ev.icon);
+      head.createSpan({ cls: "ai-wiki-step-name" }).setText(ev.summary);
+      head.createSpan({ cls: "ai-wiki-step-time muted" }).setText(this.elapsedShort());
+      if (ev.details && ev.details.length > 0) {
+        const body = step.createDiv("ai-wiki-step-preview");
+        for (const d of ev.details) {
+          body.createDiv().setText(`· ${d}`);
+        }
+      }
+      this.scrollSteps();
+    } else if (ev.kind === "system") {
+      const step = this.stepsEl.createDiv("ai-wiki-step");
+      const head = step.createDiv("ai-wiki-step-head");
+      head.createSpan({ cls: "ai-wiki-step-icon" }).setText("⚙");
+      head.createSpan({ cls: "ai-wiki-step-name muted" }).setText(translateSystemEvent(ev.message));
+      head.createSpan({ cls: "ai-wiki-step-time muted" }).setText(this.elapsedShort());
+      this.scrollSteps();
+    } else if (ev.kind === "error") {
+      this.stepsEl.createDiv("ai-wiki-step err").setText(`✗ ${ev.message}`);
+      this.scrollSteps();
+    }
+    this.updateMetrics();
+  }
+
+  private renderRatingRow(
+    parent: HTMLElement,
+    runId: string,
+    axis: string,
+    label: string,
+    initial: Rating,
+  ): void {
+    if (!this.plugin.settings.devMode?.enabled) return;
+    const T = i18n();
+    const row = parent.createDiv("ai-wiki-rating-row");
+    row.createSpan({ text: label, cls: "ai-wiki-rating-label" });
+    const up = row.createEl("button", { text: "👍", cls: "ai-wiki-rating-btn is-up", attr: { "aria-label": T.view.ratingUp } });
+    const down = row.createEl("button", { text: "👎", cls: "ai-wiki-rating-btn is-down", attr: { "aria-label": T.view.ratingDown } });
+    const render = (rating: "up" | "down" | null) => {
+      up.toggleClass("is-active", rating === "up");
+      down.toggleClass("is-active", rating === "down");
+    };
+    render(initial); // reflect persisted state on first paint
+    const handle = (rating: "up" | "down") => async () => {
+      const result = await this.plugin.controller.rateRun(runId, axis, rating);
+      if (result !== undefined) render(result); // reflect what was actually persisted
+    };
+    up.addEventListener("click", () => void handle("up")());
+    down.addEventListener("click", () => void handle("down")());
+  }
+
+  /** Render an entry's result body + (dev-mode) rating rows and comment box, bound
+   *  to entry.id. Used by both finish() and the history-row click so the rating UI is
+   *  always torn down and rebuilt for the displayed runId — never leaked across runs. */
+  private async renderResultFor(entry: RunHistoryEntry, opts?: { preserveQueryStats?: boolean }): Promise<void> {
+    const seq = ++this.renderSeq;
+    this.ratingSection?.remove();
+    this.ratingSection = null;
+
+    if (opts?.preserveQueryStats) {
+      this.showingStoredResultDuringRun = false;
+    } else {
+      if (this.state === "running") {
+        this.showingStoredResultDuringRun = true;
+        this.clearQueryStatsDom();
+      } else {
+        this.showingStoredResultDuringRun = false;
+        this.resetQueryStats();
+      }
+    }
+    this.finalEl.empty();
+    const comp = new Component();
+    comp.load();
+    await MarkdownRenderer.render(this.app, entry.finalText || "(empty)", this.finalEl, "", comp);
+    sanitizeLinks(this.finalEl);
+    if (opts?.preserveQueryStats && this.currentQueryStats && !this.queryStatsEl) {
+      const inputTokens = this.currentQueryStatsInputTokens;
+      this.renderQueryStats(this.currentQueryStats);
+      if (inputTokens !== null) this.fillQueryStatsTokens(inputTokens);
+    }
+    this.resultSection.removeClass("ai-wiki-hidden");
+    this.finalEl.removeClass("ai-wiki-hidden");
+    this.resultOpen = true;
+    this.resultToggle.setText("▼");
+
+    // format renders its axes in the preview (vision-gated, preview-bound); a past
+    // format entry shows its report but no rating/comment rows.
+    if (!this.plugin.settings.devMode?.enabled) return;
+    if (entry.status !== "done" || entry.operation === "format") return;
+    const axes = (OPERATION_AXES[entry.operation] ?? []).filter((a) => a.gate !== "vision");
+    if (axes.length === 0) return;
+
+    const persisted = await this.plugin.controller.readRun(entry.id);
+    if (seq !== this.renderSeq) return; // a newer result render superseded this one — don't append a stale ratingSection
+    this.ratingSection = this.resultSection.createDiv("ai-wiki-rating-section");
+    const view = i18n().view as unknown as Record<string, string>;
+    for (const ax of axes) {
+      this.renderRatingRow(this.ratingSection, entry.id, ax.id, view[ax.labelKey], persisted?.ratings[ax.id] ?? null);
+    }
+    this.renderCommentBox(this.ratingSection, entry.id, persisted?.comment ?? "");
+  }
+
+  private clearQueryStatsDom(): void {
+    this.queryStatsEl?.remove();
+    this.queryStatsEl = null;
+    this.queryStatsTokensEl = null;
+  }
+
+  private resetQueryStats(): void {
+    this.clearQueryStatsDom();
+    this.currentQueryStats = null;
+    this.currentQueryStatsInputTokens = null;
+  }
+
+  /** Search-stats block shown above the answer, for both Ask Domain and Ask Wiki.
+   *  Retrieval metrics are known up front; the tokens line is filled later from llm_call_stats. */
+  private renderQueryStats(ev: Extract<RunEvent, { kind: "query_stats" }>): void {
+    this.currentQueryStats = ev;
+    this.currentQueryStatsInputTokens = null;
+    this.clearQueryStatsDom();
+    if (this.showingStoredResultDuringRun) return;
+    this.resultSection.removeClass("ai-wiki-hidden");
+    const T = i18n().view;
+    const box = this.resultSection.createDiv("ai-wiki-cross-stats");
+    this.resultSection.insertBefore(box, this.finalEl);
+    const line = (label: string, value: string) => {
+      const row = box.createDiv("ai-wiki-cross-stats-row");
+      row.createSpan({ cls: "ai-wiki-cross-stats-label", text: label });
+      row.createSpan({ cls: "ai-wiki-cross-stats-value", text: value });
+    };
+    if (ev.crossDomain) {
+      line(T.statsDomainsStudied, `${ev.domainsStudied ?? 0} / ${ev.domainsTotal ?? 0}`);
+      line(T.statsInfoFrom, (ev.fromDomains ?? []).join(", ") || "—");
+      line(T.statsAnalyzed, String(ev.pagesScanned));
+      line(T.statsInAnswer, String(ev.pagesSelected));
+    } else {
+      line(T.statsDomain, ev.domainName ?? "—");
+      line(T.statsAnalyzed, String(ev.pagesScanned));
+      const selected = ev.seedCount !== undefined && ev.graphCount !== undefined
+        ? T.statsSelectedBreakdown(ev.pagesSelected, ev.seedCount, ev.graphCount)
+        : String(ev.pagesSelected);
+      line(T.statsSelected, selected);
+    }
+    const tokRow = box.createDiv("ai-wiki-cross-stats-row");
+    tokRow.createSpan({ cls: "ai-wiki-cross-stats-label", text: T.statsTokensSent });
+    this.queryStatsTokensEl = tokRow.createSpan({ cls: "ai-wiki-cross-stats-value", text: "…" });
+    for (const degrade of queryDegradeLines(ev, T)) line(degrade.label, degrade.value);
+    this.queryStatsEl = box;
+  }
+
+  /** Fill the "tokens sent" line once the LLM call reports usage. No-op if no stats block is live. */
+  private fillQueryStatsTokens(inputTokens: number): void {
+    this.currentQueryStatsInputTokens = inputTokens;
+    this.queryStatsTokensEl?.setText(String(inputTokens));
+  }
+
+  /** One free-form comment per run, persisted to eval.jsonl via commentRun. Dev mode only. */
+  private renderCommentBox(parent: HTMLElement, runId: string, initial: string): void {
+    if (!this.plugin.settings.devMode?.enabled) return;
+    const T = i18n();
+    const box = parent.createDiv("ai-wiki-comment-box");
+    const ta = box.createEl("textarea", {
+      cls: "ai-wiki-comment-input",
+      attr: { placeholder: T.view.commentPlaceholder, rows: "4" },
+    });
+    ta.value = initial;
+    let savedValue = initial;
+    const actions = box.createDiv("ai-wiki-comment-actions");
+    const saveBtn = actions.createEl("button", { text: T.view.commentSave });
+    const syncSaveButton = () => {
+      if (ta.value === savedValue) {
+        saveBtn.disabled = true;
+        saveBtn.setText(T.view.commentSavedBtn);
+      } else {
+        saveBtn.disabled = false;
+        saveBtn.setText(T.view.commentSave);
+      }
+    };
+    syncSaveButton();
+    ta.addEventListener("input", syncSaveButton);
+    saveBtn.addEventListener("click", () => void (async () => {
+      const submitted = ta.value;
+      const saved = await this.plugin.controller.commentRun(runId, submitted);
+      if (saved !== undefined) {
+        savedValue = submitted;
+        syncSaveButton();
+      }
+    })());
+  }
+
+  private renderFormatPreview(tempPath: string, report: string, missing: { token: string; context: string }[], runId?: string, visionCount?: number): void {
+    const T = i18n();
+    this.formatPreviewSection?.remove();
+
+    const root = this.containerEl.children[1] as HTMLElement;
+    this.formatPreviewSection = root.createDiv("ai-wiki-format-preview");
+
+    this.formatPreviewSection.createEl("h4", { text: T.view.formatPreviewHeader });
+
+    const link = this.formatPreviewSection.createEl("a", {
+      text: `📄 ${tempPath}`,
+      cls: "internal-link",
+      attr: { href: tempPath, "data-href": tempPath },
+    });
+    void link;
+    registerLinkHandler(this.formatPreviewSection, this.app);
+
+    const reportEl = this.formatPreviewSection.createDiv("ai-wiki-format-report");
+    const comp = new Component();
+    comp.load();
+    void MarkdownRenderer.render(this.app, report, reportEl, "", comp).then(() => sanitizeLinks(reportEl));
+
+    if (missing.length > 0) {
+      const warn = this.formatPreviewSection.createEl("details", { cls: "ai-wiki-format-warn" });
+      const summary = warn.createEl("summary");
+      summary.setText(T.view.formatMissingTokens(missing.length));
+      const list = warn.createEl("ul", { cls: "ai-wiki-format-warn-list" });
+      for (const m of missing) {
+        const li = list.createEl("li");
+        li.createEl("code", { text: m.token, cls: "ai-wiki-format-warn-token" });
+        if (m.context) {
+          li.createSpan({ text: " — ", cls: "ai-wiki-format-warn-sep" });
+          li.createSpan({ text: m.context, cls: "ai-wiki-format-warn-ctx" });
+        }
+      }
+    }
+
+    const btnRow = this.formatPreviewSection.createDiv("ai-wiki-format-actions");
+    const applyReplaceBtn = btnRow.createEl("button", { text: T.view.formatApplyReplace, cls: "mod-cta" });
+    applyReplaceBtn.addEventListener("click", () => void this.plugin.controller.formatApply(false));
+
+    const applyKeepBtn = btnRow.createEl("button", { text: T.view.formatApplyKeep });
+    applyKeepBtn.addEventListener("click", () => void this.plugin.controller.formatApply(true));
+
+    const cancelBtn = btnRow.createEl("button", { text: T.view.formatCancelBtn, cls: "mod-warning" });
+    cancelBtn.addEventListener("click", () => void this.plugin.controller.formatCancel());
+
+    const chatBox = this.formatPreviewSection.createDiv("ai-wiki-format-chat");
+    const inputEl = chatBox.createEl("textarea", {
+      cls: "ai-wiki-format-chat-input",
+      attr: { placeholder: T.view.formatRefinePlaceholder, rows: "3" },
+    });
+    const sendRow = chatBox.createDiv("ai-wiki-format-chat-send-row");
+    const sendBtn = sendRow.createEl("button", { text: T.view.chatSend });
+    sendBtn.addEventListener("click", () => {
+      const msg = inputEl.value.trim();
+      if (!msg) return;
+      inputEl.value = "";
+      void this.plugin.controller.formatRefine(msg);
+    });
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendBtn.click();
+      }
+    });
+
+    if (runId) {
+      const section = this.formatPreviewSection;
+      const view = i18n().view as unknown as Record<string, string>;
+      const rid = runId;
+      void (async () => {
+        const persisted = await this.plugin.controller.readRun(rid);
+        if (section !== this.formatPreviewSection) return; // preview replaced/torn down while readRun was in flight
+        for (const ax of OPERATION_AXES["format"]) {
+          if (ax.gate === "vision" && (visionCount ?? 0) === 0) continue;
+          this.renderRatingRow(section, rid, ax.id, view[ax.labelKey], persisted?.ratings[ax.id] ?? null);
+        }
+        this.renderCommentBox(section, rid, persisted?.comment ?? "");
+      })();
+    }
+  }
+
+  async finish(entry: RunHistoryEntry): Promise<void> {
+    for (const id of this.llmLifecycleEvents.keys()) {
+      this.llmWaitingTimers.stop(id);
+      this.refreshLlmLifecycle(id);
+    }
+    this.llmWaitingTimers.clearAll();
+    this.state = entry.status;
+    this.statusEl.setText(this.statusLabel(entry));
+    this.cancelBtn.disabled = true;
+    if (this.initBtn) this.initBtn.disabled = false;
+    this.updateButtonAvailability();
+    if (this.tickHandle !== null) { window.clearTimeout(this.tickHandle); this.tickHandle = null; }
+    this.updateMetrics();
+    this.liveStatusSection?.addClass("ai-wiki-hidden");
+    const totalDur = ((entry.finishedAt - entry.startedAt) / 1000).toFixed(1);
+    this.progressCount.setText(`${totalDur}s`);
+    this.resultSpeedEl?.setText(this.buildSpeedText());
+    this.finalEl.empty();
+    if (entry.finalText) {
+      await this.renderResultFor(entry, { preserveQueryStats: true });
+      this.lastRunId = entry.id;
+
+      const CHAT_OPS: WikiOperation[] = ["lint", "lint-chat", "ingest", "query"];
+      if (CHAT_OPS.includes(entry.operation) && entry.status === "done" && entry.finalText) {
+        this.lastContext = {
+          operation: entry.operation,
+          domainId: entry.domainId,
+          report: entry.finalText,
+        };
+        this.chatHistory = [];
+        this.showChatSection();
+      }
+    }
+    this.renderHistory();
+    this.stepsOpen = false;
+    this.stepsEl.addClass("ai-wiki-hidden");
+    this.progressToggle.setText("▶");
+  }
+
+  private showChatSection(): void {
+    this.chatSection?.remove();
+    this.chatOpen = true;
+    const T = i18n();
+    this.chatSection = this.resultSection.createDiv("ai-wiki-chat-section");
+
+    const chatHeader = this.chatSection.createDiv("ai-wiki-progress-header");
+    const chatH4 = chatHeader.createEl("h4", { cls: "ai-wiki-progress-title" });
+    this.chatToggle = chatH4.createSpan({ cls: "ai-wiki-progress-arrow", text: "▼" });
+    chatH4.appendText(` ${T.view.chatLabel}`);
+    chatHeader.addEventListener("click", () => this.toggleChat());
+
+    this.chatBodyEl = this.chatSection.createDiv("ai-wiki-chat-body");
+    this.chatMessagesEl = this.chatBodyEl.createDiv("ai-wiki-chat-messages");
+    const inputRow = this.chatBodyEl.createDiv("ai-wiki-chat-input-row");
+    this.chatInputEl = inputRow.createEl("textarea", { cls: "ai-wiki-chat-input", attr: { rows: "2" } });
+    this.chatSendBtn = inputRow.createEl("button", { text: T.view.chatSend, cls: "ai-wiki-chat-send" });
+    const submit = () => {
+      const text = this.chatInputEl!.value.trim();
+      if (!text || !this.lastContext) return;
+      this.chatInputEl!.value = "";
+      this.addChatBubble("user", text);
+      this.lastUserMessage = text;
+      const ctx = this.lastContext;
+      if (ctx.operation === "lint" || ctx.operation === "lint-chat") {
+        const domainId = (ctx.domainId ?? this.domainSelect?.value) || undefined;
+        if (!domainId) {
+          new Notice(i18n().view.selectDomainFirst ?? "Select a domain first");
+          return;
+        }
+        void this.plugin.controller.lintApplyFromChat(
+          domainId,
+          ctx.report,
+          this.chatHistory,
+          text,
+        );
+      } else {
+        void this.plugin.controller.chat(
+          ctx.operation,
+          ctx.domainId,
+          ctx.report,
+          this.chatHistory,
+          text,
+        );
+      }
+    };
+    this.chatSendBtn.addEventListener("click", submit);
+  }
+
+  private addChatBubble(role: "user" | "assistant", text: string): HTMLElement {
+    const el = this.chatMessagesEl!.createDiv(`ai-wiki-chat-msg ai-wiki-chat-msg--${role}`);
+    if (role === "user") {
+      el.setText(text);
+    } else {
+      const comp = new Component();
+      comp.load();
+      void MarkdownRenderer.render(this.app, text, el, "", comp).then(() => sanitizeLinks(el));
+      registerLinkHandler(el, this.app);
+    }
+    const copyBtn = el.createEl("button", { cls: "ai-wiki-copy-btn", attr: { "aria-label": "Copy" } });
+    setIcon(copyBtn, "copy");
+    copyBtn.addEventListener("click", () => {
+      void navigator.clipboard.writeText(text).then(() => {
+        setIcon(copyBtn, "check");
+        window.setTimeout(() => setIcon(copyBtn, "copy"), 1500);
+      });
+    });
+    el.scrollIntoView({ block: "end" });
+    return el;
+  }
+
+  setChatRunning(): void {
+    if (this.chatSendBtn) this.chatSendBtn.disabled = true;
+    if (this.chatInputEl) this.chatInputEl.disabled = true;
+    this.currentChatBuffer = "";
+    if (this.chatMessagesEl) {
+      this.currentChatBubble = this.chatMessagesEl.createDiv("ai-wiki-chat-msg ai-wiki-chat-msg--assistant ai-wiki-chat-msg--streaming");
+      this.currentChatBubble.setText("…");
+      this.currentChatBubble.scrollIntoView({ block: "end" });
+    }
+    this.chatStartTs = Date.now();
+    if (this.chatTickHandle !== null) { window.clearTimeout(this.chatTickHandle); this.chatTickHandle = null; }
+    this.scheduleChatTick();
+  }
+
+  private scheduleChatTick(): void {
+    this.chatTickHandle = window.setTimeout(() => {
+      if (this.currentChatBubble) {
+        const s = ((Date.now() - this.chatStartTs) / 1000).toFixed(1);
+        this.currentChatBubble.setText(`⏳ ${s}s…`);
+        this.scheduleChatTick();
+      } else {
+        this.chatTickHandle = null;
+      }
+    }, 500);
+  }
+
+  appendChatEvent(ev: RunEvent): void {
+    if (ev.kind === "assistant_text" && !ev.isReasoning && this.currentChatBubble) {
+      if (this.chatTickHandle !== null) {
+        window.clearTimeout(this.chatTickHandle);
+        this.chatTickHandle = null;
+        this.currentChatBubble.setText("");
+      }
+      this.currentChatBuffer += ev.delta;
+      this.currentChatBubble.setText(this.currentChatBuffer);
+      this.currentChatBubble.scrollIntoView({ block: "end" });
+    }
+    if (ev.kind === "assistant_replace" && this.currentChatBubble) {
+      this.currentChatBuffer = ev.text;
+      this.currentChatBubble.setText(ev.text);
+      this.currentChatBubble.scrollIntoView({ block: "end" });
+    }
+  }
+
+  finishChat(msg: ChatMessage, isError: boolean): void {
+    if (this.chatTickHandle !== null) {
+      window.clearTimeout(this.chatTickHandle);
+      this.chatTickHandle = null;
+    }
+    if (this.chatSendBtn) this.chatSendBtn.disabled = false;
+    if (this.chatInputEl) { this.chatInputEl.disabled = false; this.chatInputEl.focus(); }
+    if (this.currentChatBubble) {
+      this.currentChatBubble.removeClass("ai-wiki-chat-msg--streaming");
+      this.currentChatBubble.empty();
+      if (isError) {
+        this.currentChatBubble.addClass("ai-wiki-chat-msg--error");
+        this.currentChatBubble.setText(msg.content);
+      } else {
+        const comp = new Component();
+        comp.load();
+        const bubble = this.currentChatBubble;
+        void MarkdownRenderer.render(this.app, msg.content, bubble, "", comp).then(() => sanitizeLinks(bubble));
+        registerLinkHandler(bubble, this.app);
+      }
+      this.currentChatBubble = null;
+    }
+    if (!isError && this.lastUserMessage) {
+      this.chatHistory.push({ role: "user", content: this.lastUserMessage });
+      this.chatHistory.push(msg);
+    }
+    this.lastUserMessage = "";
+    this.currentChatBuffer = "";
+  }
+
+  private toggleHistory(): void {
+    this.historyOpen = !this.historyOpen;
+    if (this.historyOpen) {
+      this.historyEl.removeClass("ai-wiki-hidden");
+    } else {
+      this.historyEl.addClass("ai-wiki-hidden");
+    }
+    this.historyToggle.setText(this.historyOpen ? "▼" : "▶");
+  }
+
+  private toggleResult(): void {
+    this.resultOpen = !this.resultOpen;
+    if (this.resultOpen) {
+      this.finalEl.removeClass("ai-wiki-hidden");
+    } else {
+      this.finalEl.addClass("ai-wiki-hidden");
+    }
+    this.resultToggle.setText(this.resultOpen ? "▼" : "▶");
+  }
+
+  private toggleSteps(): void {
+    this.stepsOpen = !this.stepsOpen;
+    if (this.stepsOpen) {
+      this.stepsEl.removeClass("ai-wiki-hidden");
+      if (this.stepsPinnedToBottom) this.scrollSteps();
+    } else {
+      this.stepsEl.addClass("ai-wiki-hidden");
+    }
+    this.syncStepsScrollButton();
+    this.progressToggle.setText(this.stepsOpen ? "▼" : "▶");
+  }
+
+  private toggleChat(): void {
+    this.chatOpen = !this.chatOpen;
+    this.chatBodyEl?.toggleClass("ai-wiki-hidden", !this.chatOpen);
+    this.chatToggle?.setText(this.chatOpen ? "▼" : "▶");
+  }
+
+  private updateMetrics(): void {
+    if (this.state !== "running") {
+      this.progressCount.setText("");
+      return;
+    }
+    const dur = ((Date.now() - this.startTs) / 1000).toFixed(1);
+    this.progressCount.setText(i18n().view.stepsCount(this.stepCount, dur));
+  }
+
+  private scheduleMetricsTick(): void {
+    this.tickHandle = window.setTimeout(() => {
+      this.updateMetrics();
+      if (this.state === "running") this.scheduleMetricsTick();
+    }, 500);
+  }
+
+  private elapsedShort(): string {
+    const now = Date.now();
+    const ms = now - this.lastStepTs;
+    this.lastStepTs = now;
+    return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : "";
+  }
+
+  private scrollSteps(): void {
+    if (!this.stepsPinnedToBottom) {
+      this.syncStepsScrollButton();
+      return;
+    }
+    this.stepsEl.scrollTop = this.stepsEl.scrollHeight;
+    this.syncStepsScrollButton();
+  }
+
+  private isStepsScrolledToBottom(): boolean {
+    const remaining = this.stepsEl.scrollHeight - this.stepsEl.scrollTop - this.stepsEl.clientHeight;
+    return remaining <= 24;
+  }
+
+  private syncStepsScrollButton(): void {
+    if (!this.stepsOpen || this.stepsPinnedToBottom) {
+      this.stepsScrollBottomBtn.addClass("ai-wiki-hidden");
+      return;
+    }
+    this.stepsScrollBottomBtn.removeClass("ai-wiki-hidden");
+  }
+
+  private renderLlmLifecycle(ev: LlmLifecycleEvent): void {
+    // RunEvent delivery is serialized; reasoning belongs to the most recent
+    // lifecycle that entered preparing because assistant_text has no call ID.
+    const reasoning = resetReasoningForLifecycle(
+      ev,
+      {
+        block: this.reasoningBlock,
+        buffer: this.reasoningBuffer,
+        rafHandle: this.reasoningRafHandle,
+      },
+      (handle) => window.cancelAnimationFrame(handle),
+      (block, buffer) => {
+        const span = block.querySelector<HTMLElement>(".ai-wiki-reasoning-text");
+        if (span) span.setText(buffer);
+      },
+    );
+    this.reasoningBlock = reasoning.block;
+    this.reasoningBuffer = reasoning.buffer;
+    this.reasoningRafHandle = reasoning.rafHandle;
+    this.llmLifecycleState = reduceLlmLifecycle(this.llmLifecycleState, ev);
+    this.llmLifecycleEvents.set(ev.id, ev);
+    let row = this.llmLifecycleRows.get(ev.id);
+    if (!row) {
+      row = this.stepsEl.createDiv("ai-wiki-step ai-wiki-llm-lifecycle");
+      this.llmLifecycleRows.set(ev.id, row);
+    }
+    if (ev.phase === "waiting") {
+      this.llmWaitingTimers.start(ev.id);
+    } else if (
+      ev.phase === "producing"
+      || ev.phase === "validating"
+      || ev.phase === "applying"
+      || ev.phase === "completed"
+      || ev.phase === "retrying"
+      || ev.phase === "failed"
+      || ev.phase === "cancelled"
+    ) {
+      this.llmWaitingTimers.stop(ev.id);
+    }
+    this.refreshLlmLifecycle(ev.id);
+    const labels = i18nFor(resolveUiLang()).llmLifecycle;
+    const scale = lifecycleScale(ev, labels);
+    this.liveStatusIconEl?.setText("✦");
+    this.liveStatusTextEl?.setText(scale.action);
+    this.scrollSteps();
+  }
+
+  private refreshLlmLifecycle(id: string): void {
+    const ev = this.llmLifecycleEvents.get(id);
+    const row = this.llmLifecycleRows.get(id);
+    const call = this.llmLifecycleState.calls[id];
+    if (!ev || !row || !call) return;
+    const labels = i18nFor(resolveUiLang()).llmLifecycle;
+    const scale = lifecycleScale(
+      ev,
+      labels,
+      this.llmWaitingTimers.elapsedMs(id),
+      call.progressPhase,
+    );
+    renderLifecycleScale(row, scale);
+    this.scrollSteps();
+  }
+
+  private statusLabel(entry: RunHistoryEntry): string {
+    const dur = ((entry.finishedAt - entry.startedAt) / 1000).toFixed(1);
+    const icon = entry.status === "done" ? "✓" : entry.status === "cancelled" ? "⛔" : "✗";
+    return `${icon} ${entry.operation} (${dur}s)`;
+  }
+
+  private buildSpeedText(): string {
+    return computeSpeedText(this.llmStats);
+  }
+
+  private renderHistory(): void {
+    this.historyEl.empty();
+    const items = this.plugin.settings.history.slice().reverse();
+    if (items.length === 0) {
+      this.historySection.addClass("ai-wiki-hidden");
+      this.historyOpen = false;
+      return;
+    }
+    this.historySection.removeClass("ai-wiki-hidden");
+    for (const it of items) {
+      const row = this.historyEl.createDiv("ai-wiki-history-row");
+      row.createSpan().setText(this.statusLabel(it));
+      row.createSpan({ cls: "muted" }).setText(` ${it.args.join(" ")}`);
+      if (it.operation === "query") {
+        const rerunBtn = row.createEl("button", { text: "↺", attr: { title: "Re-run" } });
+        rerunBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          void (async () => {
+            const domains = await this.plugin.controller.loadDomains();
+            const r = resolveRerunDomain(it, domains);
+            if (!r.ok) { new Notice(i18n().view.rerunDomainMissing); return; }
+            if (this.domainSelect) {
+              // "*" is the cross-domain sentinel — the sidebar has no "*" option, so show "(all)".
+              this.domainSelect.value = r.domainId === "*" ? "" : r.domainId;
+              this.domainSelect.dispatchEvent(new Event("change"));
+            }
+            void this.plugin.controller.query(it.args[0] ?? "", r.domainId);
+          })();
+        });
+      }
+      row.addEventListener("click", () => void this.renderResultFor(it));
+    }
+  }
+
+  showQuestionModal(question: string, options: string[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const modal = new WikiQuestionModal(this.app, question, options, resolve, reject);
+      modal.open();
+    });
+  }
+}
+
+class FileContentModal extends Modal {
+  constructor(app: App, private filePath: string, private content: string) {
+    super(app);
+  }
+  onOpen(): void {
+    this.titleEl.setText(this.filePath.split("/").pop() ?? this.filePath);
+    const btnRow = this.modalEl.createDiv({ cls: "modal-button-container" });
+    if (Platform.isDesktop && Platform.isDesktopApp) {
+      const openBtn = btnRow.createEl("button", { text: "Open in system editor" });
+      openBtn.addEventListener("click", () => {
+        const basePath = (this.app.vault.adapter as unknown as Record<string, unknown>)["basePath"] as string ?? "";
+        const absPath = basePath ? `${basePath}/${this.filePath}` : this.filePath;
+        const electron = (window as Window & {
+          require(id: "electron"): { shell: { openPath(path: string): Promise<string> } };
+        }).require("electron");
+        void electron.shell.openPath(absPath);
+      });
+    }
+    this.contentEl.addClass("ai-wiki-busy-modal-content");
+    const comp = new Component();
+    comp.load();
+    void MarkdownRenderer.render(this.app, this.content, this.contentEl, this.filePath, comp);
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+class WikiQuestionModal extends Modal {
+  private settled = false;
+
+  constructor(
+    app: App,
+    private question: string,
+    private options: string[],
+    private resolve: (answer: string) => void,
+    private reject: () => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h3", { text: i18n().view.answerRequired });
+    contentEl.createEl("p", { text: this.question });
+
+    if (this.options.length > 0) {
+      const btnRow = contentEl.createDiv("ai-wiki-modal-options");
+      for (const opt of this.options) {
+        const btn = btnRow.createEl("button", { text: opt });
+        btn.addEventListener("click", () => {
+          if (this.settled) return;
+          this.settled = true;
+          this.resolve(opt);
+          this.close();
+        });
+      }
+    } else {
+      const input = contentEl.createEl("input", {
+        attr: { type: "text" },
+        cls: "ai-wiki-modal-input",
+      });
+      input.focus();
+      const submit = () => {
+        if (this.settled) return;
+        const val = input.value.trim();
+        if (!val) return;
+        this.settled = true;
+        this.resolve(val);
+        this.close();
+      };
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") submit();
+      });
+      contentEl.createEl("button", { text: "OK" }).addEventListener("click", submit);
+    }
+
+    const cancelBtn = contentEl.createEl("button", {
+      text: i18n().view.cancel,
+      cls: "mod-warning",
+    });
+    cancelBtn.addEventListener("click", () => {
+      if (this.settled) return;
+      this.settled = true;
+      this.reject();
+      this.close();
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.settled) {
+      this.settled = true;
+      this.reject();
+    }
+  }
+}
+
+function summariseInput(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const o = input as Record<string, unknown>;
+  // Приоритетные ключи по убыванию информативности.
+  const candidates: Array<[string, string?]> = [
+    ["file_path"],
+    ["path"],
+    ["pattern"],
+    ["query"],
+    ["command"],
+    ["url"],
+    ["notebook_path"],
+  ];
+  for (const [k] of candidates) {
+    const v = o[k];
+    if (typeof v === "string" && v) return truncate(v, 80);
+  }
+  // Фолбэк — первый строковый аргумент.
+  for (const k of Object.keys(o)) {
+    const v = o[k];
+    if (typeof v === "string" && v) return `${k}=${truncate(v, 60)}`;
+  }
+  return "";
+}
+
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : s.slice(0, n) + "…";
+}
+
+function sanitizeLinks(el: HTMLElement): void {
+  el.querySelectorAll("a[href]").forEach((a) => {
+    if (/^javascript:/i.test((a.getAttribute("href") ?? "").trim())) {
+      a.removeAttribute("href");
+    }
+  });
+}
+
+function translateSystemEvent(message: string): string {
+  const T = i18n().view;
+  if (message === "hook_started") return T.starting;
+  if (message === "hook_response") return T.initialising;
+  if (message.startsWith("init")) {
+    const model = message.replace(/^init\s*/, "").replace(/[()]/g, "").trim();
+    return model ? `${T.initialising} (${model})` : T.initialising;
+  }
+  return message;
+}

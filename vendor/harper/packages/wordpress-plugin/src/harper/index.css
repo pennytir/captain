@@ -1,0 +1,89 @@
+.harper-popover > div {
+	width: 300px;
+	z-index: 100;
+	padding: 10px;
+}
+
+.harper-solved-cont {
+	padding: 35px;
+	width: 100%;
+	display: flex;
+	flex-direction: row;
+	justify-content: center;
+}
+
+.harper-solved-cont h2 {
+	font-size: 20px;
+	font-weight: bold;
+}
+
+.harper-solved-cont p {
+	font-size: 16px;
+}
+
+.harper-lint-card {
+	margin: 4px;
+}
+
+.harper-lint-card h2 {
+	font-weight: bold;
+	font-size: large;
+}
+
+.harper-lint-card button {
+	width: 100%;
+	margin-top: 6px;
+}
+
+.harper-lint-config-cont {
+	overflow-x: hidden;
+}
+
+.harper-lint-config-row {
+	padding: 6px;
+}
+
+.harper-lint-config-row > h3 {
+	font-weight: bold;
+}
+
+.harper-popover > div > button {
+	width: 100%;
+	margin-top: 6px;
+}
+
+.harper-underline-Spelling {
+	border-bottom: 3px solid #ee4266;
+}
+
+.harper-underline-Capitalization {
+	border-bottom: 3px solid #540d6e;
+}
+
+.harper-underline-Style {
+	border-bottom: 3px solid #ffd23f;
+}
+
+.harper-underline-Formatting {
+	border-bottom: 3px solid #540d6e;
+}
+
+.harper-underline-Repetition {
+	border-bottom: 3px solid #3bceac;
+}
+
+.harper-underline-Enhancement {
+	border-bottom: 3px solid #0ead69;
+}
+
+.harper-underline-Readability {
+	border-bottom: 3px solid #0ead69;
+}
+
+.harper-underline-WordChoice {
+	border-bottom: 3px solid #0ead69;
+}
+
+.harper-underline-Miscellaneous {
+	border-bottom: 3px solid #3bceac;
+}

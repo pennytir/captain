@@ -1,0 +1,13 @@
+{
+	"exclude": ["src/tests/fixtures"],
+	"compilerOptions": {
+		"module": "Node16",
+		"target": "ES2022",
+		"lib": ["ES2022", "DOM"],
+		"sourceMap": true,
+		"rootDir": "src",
+		"outDir": "build",
+		"strict": true,
+		"skipLibCheck": true
+	}
+}

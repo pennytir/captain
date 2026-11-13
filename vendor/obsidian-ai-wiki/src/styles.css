@@ -1,0 +1,418 @@
+.ai-wiki-view { padding: 8px; font-size: 13px; }
+.ai-wiki-header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.ai-wiki-header h3 { margin: 0; }
+.ai-wiki-status { color: var(--text-muted); }
+
+/* Section labels */
+.ai-wiki-section-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); margin: 10px 0 4px; }
+
+/* 1. Создание — Init */
+.ai-wiki-create-row { margin-bottom: 8px; }
+.ai-wiki-init-btn { width: 100%; }
+
+/* 2+3. Домен — Ingest / Lint */
+.ai-wiki-domain { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; background: var(--background-secondary); border-radius: 4px; margin-bottom: 8px; }
+.ai-wiki-domain-row { display: flex; align-items: center; gap: 6px; }
+.ai-wiki-domain-select { flex: 1; min-width: 0; padding: 4px; }
+.ai-wiki-domain-actions { display: flex; gap: 6px; }
+.ai-wiki-domain-actions button { flex: 1; }
+.ai-wiki-domain-file-link { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 4px; color: var(--icon-color); opacity: var(--icon-opacity); cursor: pointer; flex-shrink: 0; }
+.ai-wiki-domain-file-link:hover { background: var(--background-modifier-hover); color: var(--text-normal); opacity: 1; }
+.ai-wiki-domain-file-link.is-unresolved { opacity: 0.35; pointer-events: none; }
+.ai-wiki-dryrun { color: var(--text-muted); font-size: 11px; display: inline-flex; align-items: center; gap: 3px; }
+
+/* 4. Запрос */
+.ai-wiki-ask { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.ai-wiki-query-input { width: 100%; resize: vertical; font-family: inherit; padding: 6px; }
+.ai-wiki-ask-row { display: flex; justify-content: space-between; }
+.ai-wiki-ask-buttons { display: flex; gap: 6px; }
+.ai-wiki-ask-row button { flex: 0 0 auto; }
+.ai-wiki-busy-modal-content { max-height: 60vh; overflow-y: auto; }
+
+.ai-wiki-progress-header { display: flex; align-items: baseline; justify-content: space-between; margin-top: 6px; }
+.ai-wiki-progress-header h4 { margin: 0; }
+.ai-wiki-metrics { color: var(--text-muted); font-size: 11px; font-family: var(--font-monospace); }
+
+.ai-wiki-steps {
+  font-family: var(--font-monospace);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 6px;
+  min-height: 80px;
+  max-height: 360px;
+  overflow: auto;
+}
+.ai-wiki-scroll-bottom {
+  display: block;
+  margin: 4px 0 0 auto;
+  min-width: 0;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.ai-wiki-step { padding: 3px 0; border-bottom: 1px dotted transparent; }
+.ai-wiki-step + .ai-wiki-step { border-top: 1px dotted var(--background-modifier-border); }
+.ai-wiki-step-head { display: flex; gap: 6px; align-items: baseline; }
+.ai-wiki-step-icon { flex: 0 0 auto; }
+.ai-wiki-step-name { font-weight: 600; }
+.ai-wiki-step-arg { color: var(--text-normal); word-break: break-all; flex: 1; min-width: 0; }
+.ai-wiki-step-time { flex: 0 0 auto; font-size: 11px; margin-left: auto; }
+.ai-wiki-step-head.ok .ai-wiki-step-name { color: var(--text-success); }
+.ai-wiki-step-head.err .ai-wiki-step-name { color: var(--text-error); }
+.ai-wiki-step-detail { margin-top: 2px; font-size: 11px; color: var(--text-muted); }
+.ai-wiki-step-detail-header { font-weight: 600; color: var(--text-normal); margin-top: 3px; }
+.ai-wiki-step-detail-item { padding-left: 1.2em; word-break: break-word; }
+.ai-wiki-step-preview {
+  margin: 2px 0 0 22px;
+  padding: 4px 6px;
+  background: var(--background-secondary);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ai-wiki-step.reasoning { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; padding: 4px 0; opacity: 0.6; }
+.ai-wiki-reasoning-text { white-space: pre-wrap; word-break: break-word; font-style: italic; color: var(--text-muted); font-size: 0.88em; }
+.ai-wiki-llm-action { font-weight: 600; margin-bottom: 3px; }
+.ai-wiki-llm-phases { display: grid; gap: 2px; font-family: var(--font-interface); font-size: 11px; }
+.ai-wiki-llm-phase { display: flex; gap: 5px; color: var(--text-muted); }
+.ai-wiki-llm-phase--current { color: var(--text-accent); font-weight: 600; }
+.ai-wiki-llm-phase--completed { color: var(--text-success); }
+.ai-wiki-llm-phase--failed { color: var(--text-error); font-weight: 600; }
+.ai-wiki-llm-phase--pending { color: var(--text-faint); }
+.ai-wiki-step.muted, .muted { color: var(--text-muted); }
+.ai-wiki-step.err { color: var(--text-error); }
+
+.ai-wiki-final { border-top: 1px dashed var(--background-modifier-border); padding-top: 8px; margin-top: 8px; }
+
+.ai-wiki-final,
+.ai-wiki-chat-msg,
+.ai-wiki-eval-result {
+  user-select: text;
+}
+
+.ai-wiki-count-muted {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.ai-wiki-settings-busy-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 12px 16px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: var(--background-modifier-error-rgb, rgba(255,80,80,0.12));
+  color: var(--text-warning, var(--text-muted));
+  font-size: 0.9em;
+}
+
+.ai-wiki-lint-btn-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+
+/* Чат после lint */
+.ai-wiki-chat-section { margin-top: 10px; border-top: 1px solid var(--background-modifier-border); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.ai-wiki-chat-messages { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
+.ai-wiki-chat-msg { padding: 6px 8px; border-radius: 6px; font-size: 13px; line-height: 1.5; }
+.ai-wiki-chat-msg--user { background: var(--background-modifier-form-field); align-self: flex-end; max-width: 90%; white-space: pre-wrap; word-break: break-word; }
+.ai-wiki-chat-msg--assistant { background: var(--background-secondary); align-self: flex-start; max-width: 95%; }
+.ai-wiki-chat-msg--streaming { opacity: 0.7; font-style: italic; }
+.ai-wiki-chat-msg--error { color: var(--text-error); }
+.ai-wiki-chat-msg--assistant p { margin: 0 0 4px; }
+.ai-wiki-chat-msg--assistant p:last-child { margin: 0; }
+.ai-wiki-chat-input-row { display: flex; gap: 6px; align-items: flex-end; }
+.ai-wiki-chat-input { flex: 1; resize: none; font-family: inherit; padding: 6px; }
+.ai-wiki-chat-send { flex: 0 0 auto; }
+.ai-wiki-history-row { display: flex; align-items: center; padding: 3px 0; cursor: pointer; }
+.ai-wiki-history-row:hover { background: var(--background-modifier-hover); }
+.ai-wiki-history-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-wiki-history-row button { flex: 0 0 auto; margin-left: 8px; padding: 1px 5px; font-size: 0.75em; line-height: 1.4; }
+
+/* ask_user step indicator */
+.ai-wiki-step--ask { color: var(--text-muted); font-style: italic; }
+
+/* Live status — compact one-line activity indicator during operation */
+.ai-wiki-live-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  background: var(--background-secondary);
+  border-radius: 4px;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.ai-wiki-live-status-icon { flex: 0 0 auto; }
+.ai-wiki-live-status-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* WikiQuestionModal */
+.ai-wiki-modal-options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.ai-wiki-modal-input { width: 100%; margin-top: 8px; box-sizing: border-box; }
+
+.ai-wiki-hidden {
+  display: none;
+}
+
+.ai-wiki-settings-textarea {
+  min-height: 96px;
+  width: 100%;
+}
+
+.ai-wiki-monospace {
+  font-family: var(--font-monospace);
+}
+
+/* EditDomainModal — entity types cards */
+.ai-wiki-et-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 12px 0 6px;
+}
+.ai-wiki-et-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-normal);
+}
+.ai-wiki-et-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  overflow: hidden;
+}
+.ai-wiki-et-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: var(--background-secondary);
+}
+.ai-wiki-et-card-type {
+  font-weight: 600;
+  color: var(--text-accent);
+}
+.ai-wiki-et-card-subfolder {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+}
+.ai-wiki-et-card-body {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+.ai-wiki-et-card-desc {
+  margin: 0 0 4px;
+  color: var(--text-normal);
+}
+.ai-wiki-et-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.ai-wiki-et-card-tag {
+  background: var(--background-modifier-form-field);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.ai-wiki-et-card-meta {
+  display: block;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* EditDomainModal — source paths list */
+.ai-wiki-sp-header {
+  margin: 12px 0 6px;
+}
+.ai-wiki-sp-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-normal);
+}
+.ai-wiki-sp-list {
+  margin-bottom: 4px;
+}
+.ai-wiki-sp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.ai-wiki-sp-path {
+  flex: 1;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-normal);
+}
+.ai-wiki-sp-remove {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.ai-wiki-sp-add-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.ai-wiki-sp-input {
+  flex: 1;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+}
+
+.ai-wiki-format-preview {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-secondary);
+}
+.ai-wiki-format-preview h4 {
+  margin: 0 0 8px 0;
+}
+.ai-wiki-format-report {
+  margin-bottom: 8px;
+}
+.ai-wiki-format-warn {
+  margin: 8px 0;
+  padding: 6px 8px;
+  border-radius: 3px;
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+  font-size: 12px;
+}
+.ai-wiki-format-warn summary {
+  cursor: pointer;
+}
+.ai-wiki-format-warn-list {
+  margin: 6px 0 0 0;
+  padding-left: 18px;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 11px;
+}
+.ai-wiki-format-warn-list li {
+  margin: 4px 0;
+  word-break: break-word;
+}
+.ai-wiki-format-warn-token {
+  font-family: var(--font-monospace);
+  font-weight: 600;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0 4px;
+  border-radius: 2px;
+}
+.ai-wiki-format-warn-sep {
+  opacity: 0.7;
+}
+.ai-wiki-format-warn-ctx {
+  opacity: 0.85;
+  font-style: italic;
+}
+.ai-wiki-format-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.ai-wiki-format-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.ai-wiki-format-chat-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  resize: vertical;
+  min-height: 6em;
+}
+.ai-wiki-format-chat-send-row {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Copy button on chat messages */
+.ai-wiki-chat-msg {
+  position: relative;
+}
+.ai-wiki-copy-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px;
+}
+.ai-wiki-chat-msg:hover .ai-wiki-copy-btn {
+  opacity: 1;
+}
+
+/* Dev-mode rating buttons (👍/👎) */
+.ai-wiki-rating-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.ai-wiki-rating-label { color: var(--text-muted); font-size: 0.85em; }
+.ai-wiki-rating-btn {
+  cursor: pointer;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  padding: 2px 8px;
+  font-size: 1em;
+  line-height: 1.4;
+  opacity: 0.5;
+  transition: opacity 0.15s, background 0.15s, border-color 0.15s;
+}
+.ai-wiki-rating-btn:hover { opacity: 0.85; }
+.ai-wiki-rating-btn.is-active { opacity: 1; }
+.ai-wiki-rating-btn.is-up.is-active {
+  background: color-mix(in srgb, var(--color-green) 25%, var(--background-secondary));
+  border-color: var(--color-green);
+}
+.ai-wiki-rating-btn.is-down.is-active {
+  background: color-mix(in srgb, var(--color-red) 25%, var(--background-secondary));
+  border-color: var(--color-red);
+}
+
+.ai-wiki-cross-stats {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-top: 10px;
+  margin-bottom: 8px;
+  font-size: 0.85em;
+}
+.ai-wiki-cross-stats-row { display: flex; justify-content: space-between; gap: 8px; }
+.ai-wiki-cross-stats-label { color: var(--text-muted); }
+.ai-wiki-cross-stats-value { font-weight: 600; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.ai-wiki-comment-box { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.ai-wiki-comment-input { width: 100%; box-sizing: border-box; resize: vertical; font-family: inherit; padding: 6px; }
+.ai-wiki-comment-actions { display: flex; justify-content: flex-end; }

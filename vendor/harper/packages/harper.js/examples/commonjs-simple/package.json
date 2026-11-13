@@ -1,0 +1,11 @@
+{
+	"name": "commonjs-simple",
+	"version": "0.0.1",
+	"private": true,
+	"scripts": {
+		"start": "node index.js"
+	},
+	"dependencies": {
+		"harper.js": "workspace:*"
+	}
+}

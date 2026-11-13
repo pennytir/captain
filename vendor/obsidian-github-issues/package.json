@@ -1,0 +1,38 @@
+{
+	"name": "github-issues",
+	"version": "1.9.4",
+	"description": "Track GitHub and GitLab issues and pull/merge requests in Obsidian",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"format": "npx prettier . --write",
+		"version": "node version-bump.mjs"
+	},
+	"keywords": [
+		"obsidian",
+		"github",
+		"gitlab",
+		"tracker",
+		"issues",
+		"pull-requests",
+		"merge-requests"
+	],
+	"author": "LonoxX",
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^26.1.2",
+		"esbuild": "^0.28.1",
+		"eslint": "^10.8.0",
+		"eslint-plugin-obsidianmd": "^0.4.1",
+		"obsidian": "^1.13.1",
+		"prettier": "^3.9.6",
+		"tslib": "^2.8.1",
+		"typescript": "^6.0.3",
+		"typescript-eslint": "^8.66.0"
+	},
+	"dependencies": {
+		"date-fns": "4.4.0",
+		"octokit": "5.0.5"
+	}
+}

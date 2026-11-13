@@ -1,0 +1,115 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.3.3/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"files": {
+		"ignoreUnknown": true,
+		"includes": [
+			".buildkite/**/*.cjs",
+			"**/packages/**/*",
+			"**/harper-desktop/**/*",
+			"**/*.json",
+			"!**/test-results",
+			"!**/packages/chrome-plugin/tests/pages/**/*",
+			"!**/node_modules",
+			"!**/mariadb_data",
+			"!**/dist",
+			"!**/target",
+			"!**/build",
+			"!**/temp",
+			"!**/*.zip",
+			"!**/*.rs",
+			"!**/harper-wasm/pkg",
+			"!**/.vscode-test",
+			"!**/.svelte-kit",
+			"!**/packages/obsidian-plugin/main.js",
+			"!**/pnpm-lock.yaml",
+			"!**/package-lock.json",
+			"!**/playwright-report",
+			"!**/yarn.lock"
+		]
+	},
+	"css": {
+		"parser": {
+			"tailwindDirectives": true
+		}
+	},
+	"formatter": {
+		"enabled": true,
+		"lineWidth": 100,
+		"indentStyle": "tab",
+		"useEditorconfig": true
+	},
+	"assist": {
+		"actions": {
+			"source": {
+				"organizeImports": "on"
+			}
+		}
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"suspicious": {
+				"noExplicitAny": "off",
+				"noArrayIndexKey": "off",
+				"noLabelVar": "warn",
+				"noDoubleEquals": "off"
+			},
+			"a11y": {
+				"noSvgWithoutTitle": "off",
+				"useGenericFontNames": "warn"
+			},
+			"correctness": {
+				"useExhaustiveDependencies": "off",
+				"noUnusedVariables": "off"
+			},
+			"style": {
+				"noParameterAssign": "off",
+				"noNonNullAssertion": "off",
+				"noUselessElse": "off",
+				"useNodejsImportProtocol": "off",
+				"useAsConstAssertion": "error",
+				"useDefaultParameterLast": "error",
+				"useEnumInitializers": "error",
+				"useSelfClosingElements": "error",
+				"useSingleVarDeclarator": "error",
+				"noUnusedTemplateLiteral": "error",
+				"useNumberNamespace": "error",
+				"noInferrableTypes": "error"
+			},
+			"complexity": {
+				"noForEach": "off",
+				"noStaticOnlyClass": "off",
+				"noThisInStatic": "off",
+				"noArguments": "off",
+				"noUselessFragments": "off"
+			}
+		}
+	},
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "single"
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["**/*.svelte", "**/*.astro", "**/*.vue"],
+			"linter": {
+				"rules": {
+					"correctness": {
+						"noUnusedImports": "off"
+					},
+					"style": {
+						"useConst": "off",
+						"useImportType": "off"
+					}
+				}
+			}
+		}
+	]
+}

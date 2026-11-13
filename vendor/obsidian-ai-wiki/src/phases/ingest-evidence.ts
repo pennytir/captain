@@ -1,0 +1,2126 @@
+import type OpenAI from "openai";
+import { z } from "zod";
+import {
+  assertCompleteSourceCoverage,
+  chunkMarkdownSource,
+  createSourceChunkRangeFactory,
+  type SourceChunk,
+} from "../markdown-chunks";
+import {
+  createPromptBudgetEvent,
+  classifyContextError,
+  estimatePreparedMessages,
+  PromptBudgetExceededError,
+  runWithContextRepack,
+} from "../prompt-budget";
+import { estimateText } from "../token-estimate";
+import type {
+  CompressionProfile,
+  LlmCallOptions,
+  LlmClient,
+  LlmChatCompletionCreateOptions,
+  RunEvent,
+} from "../types";
+import {
+  createLlmLifecycle,
+  outputRetryOptions,
+  runStructuredWithRetry,
+  StructuredValidationError,
+  type RunStructuredArgs,
+  type RunStructuredResult,
+} from "./structured-output";
+import { lifecycleEvent } from "../llm-lifecycle";
+import { hashSource } from "../incremental-sources";
+import { prepareChatMessages } from "./llm-utils";
+import { sentinelJsonProfile } from "./framed-output";
+import mapPrompt from "../../prompts/ingest-evidence-map.md";
+import reducePrompt from "../../prompts/ingest-evidence-reduce.md";
+import {
+  EvidenceMapperOutputSchema,
+  EntityEvidenceSchema,
+  PreVerifiedEntityEvidenceSchema,
+  EvidenceMapSchema,
+  EvidencePacketSchema,
+  NoEvidenceSchema,
+} from "./zod-schemas";
+
+const MAPPER_ESTIMATE_SAFETY_TOKENS = 128;
+const STRUCTURED_REPAIR_DETAIL_MAX_BYTES = 26;
+const structuredRepairEncoder = new TextEncoder();
+
+export interface EvidenceRange {
+  startLine: number;
+  endLine: number;
+}
+
+export interface EvidencePacket {
+  id: string;
+  chunkId: string;
+  entityKey: string;
+  entityType?: string;
+  facts: string[];
+  exactSourceRanges: EvidenceRange[];
+  links: string[];
+  sourceAnchor: string;
+}
+
+export interface VerifiedEvidencePacket extends EvidencePacket {
+  exactSource: Array<EvidenceRange & { text: string }>;
+}
+
+export interface EntityEvidence {
+  entityKey: string;
+  entityType?: string;
+  packetIds: string[];
+  facts: string[];
+  exactSourceRanges: EvidenceRange[];
+  exactSource: Array<EvidenceRange & { text: string }>;
+  links: string[];
+}
+
+export interface PreVerifiedEntityEvidence {
+  entityKey: string;
+  entityType?: string;
+  packetIds: string[];
+  facts: string[];
+  exactSourceRanges: EvidenceRange[];
+  links: string[];
+}
+
+export interface NoEvidence {
+  chunkId: string;
+  reason: string;
+}
+
+export interface EvidenceChunk {
+  id: string;
+  startLine: number;
+  endLine: number;
+}
+
+export class EvidenceCoverageError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "EvidenceCoverageError";
+  }
+}
+
+export class EvidenceReducerError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "EvidenceReducerError";
+  }
+}
+
+const ENTITY_KEY_RE = /^[a-z0-9]+(?:[_-][a-z0-9]+)*$/;
+
+function assertEntityKey(key: string): void {
+  if (!ENTITY_KEY_RE.test(key)) {
+    throw new EvidenceCoverageError(
+      `Invalid normalized entity key "${key}"; expected ^[a-z0-9]+(?:[_-][a-z0-9]+)*$ `
+      + `(example conversion: "proxy.pac" -> "proxy-pac")`,
+    );
+  }
+}
+
+function unique<T>(values: T[], key: (value: T) => string): T[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const valueKey = key(value);
+    if (seen.has(valueKey)) return false;
+    seen.add(valueKey);
+    return true;
+  });
+}
+
+function estimateBootstrapPayload(value: BootstrapEvidence, calibration?: number): number {
+  return estimatePreparedMessages([{ role: "user", content: JSON.stringify(value) }], calibration);
+}
+
+export { estimateBootstrapPayload as estimateBootstrapPayloadForTest };
+
+/**
+ * Caps for the two lists every split group duplicates. They bound the per-group
+ * overhead so the chunk budget is computable BEFORE the evidence that fills it
+ * exists — the budget governs the very preparation that would otherwise have to
+ * be measured. Both lists are naming and language signals derived from the whole
+ * corpus: no coverage invariant reads them and no later phase consumes them
+ * beyond the Init prompt, so bounding them drops nothing that is not already
+ * carried, in full, by the candidates.
+ */
+const MAX_DOMAIN_THEMES = 24;
+const MAX_LANGUAGE_EVIDENCE = 12;
+/**
+ * Per-item ceiling in estimator tokens on the JSON-encoded item, not in
+ * characters: under the character-class rates one Cyrillic character costs 2.3
+ * estimator tokens per word character and one CJK character costs 8, so a
+ * character cap would understate the worst case by the same factors. Measuring
+ * the encoded form also absorbs escaping.
+ */
+const MAX_OVERHEAD_ITEM_TOKENS = 48;
+
+/**
+ * At most `limit` items spread evenly across `items`, in their original order.
+ * A prefix would describe the opening of the document and nothing else: both
+ * lists this bounds are naming and language signals about the WHOLE corpus, and
+ * a note that switches language halfway would be bootstrapped as monolingual.
+ * The first and last items are always kept, so the span of the source is visible
+ * whatever the limit.
+ */
+function sampleEvenly<T>(items: readonly T[], limit: number): T[] {
+  if (items.length <= limit) return [...items];
+  if (limit <= 1) return limit === 1 ? [items[0]] : [];
+  const step = (items.length - 1) / (limit - 1);
+  return Array.from({ length: limit }, (_, index) => items[Math.round(index * step)]);
+}
+
+/** Longest prefix of `value` whose JSON encoding fits `MAX_OVERHEAD_ITEM_TOKENS`. */
+function boundOverheadItem(value: string): string {
+  if (estimateText(JSON.stringify(value)) <= MAX_OVERHEAD_ITEM_TOKENS) return value;
+  const characters = [...value];
+  let low = 0;
+  let high = characters.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (estimateText(JSON.stringify(characters.slice(0, middle).join(""))) <= MAX_OVERHEAD_ITEM_TOKENS) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return characters.slice(0, low).join("");
+}
+
+/**
+ * Upper bound, in calibrated tokens, on what one split group carries besides its
+ * candidates: both capped lists at full length plus the JSON envelope. Each item
+ * costs at most `MAX_OVERHEAD_ITEM_TOKENS` encoded, plus one separator character
+ * (below one token) — so the arithmetic bound holds for any script.
+ */
+export function worstCaseBootstrapOverheadTokens(calibration?: number): number {
+  const items = MAX_DOMAIN_THEMES + MAX_LANGUAGE_EVIDENCE;
+  const envelope = estimateBootstrapPayload(
+    { candidates: [], domainThemes: [], languageEvidence: [] },
+    calibration,
+  );
+  return envelope + Math.ceil(items * (MAX_OVERHEAD_ITEM_TOKENS + 1) * (calibration ?? 1));
+}
+
+function emptyBootstrapGroup(value: BootstrapEvidence): BootstrapEvidence {
+  return {
+    candidates: [],
+    domainThemes: [...value.domainThemes],
+    languageEvidence: [...value.languageEvidence],
+  };
+}
+
+/**
+ * Splits a candidate into sub-candidates sharing its entityKey and carrying
+ * disjoint evidence. A candidate aggregates facts and ranges across every chunk
+ * that mentions the entity, so bounding the chunk does not bound the candidate.
+ */
+function subdivideCandidate(
+  candidate: BootstrapCandidateEvidence,
+  parts: number,
+): BootstrapCandidateEvidence[] {
+  const total = Math.max(candidate.facts.length, candidate.exactSource.length, 1);
+  const size = Math.max(1, Math.ceil(total / Math.max(1, parts)));
+  const result: BootstrapCandidateEvidence[] = [];
+  for (let offset = 0; offset < total; offset += size) {
+    result.push({
+      entityKey: candidate.entityKey,
+      packetIds: [...candidate.packetIds],
+      facts: candidate.facts.slice(offset, offset + size),
+      exactSource: candidate.exactSource.slice(offset, offset + size).map((range) => ({ ...range })),
+    });
+  }
+  // Unreachable from the only call site — a candidate of at most one unit is
+  // classified atomic before it gets here, and every part of a candidate with
+  // two or more units carries at least one of them. Kept as a guard so the
+  // helper cannot return empty candidates if it is ever called directly.
+  return result.filter((part) => part.facts.length > 0 || part.exactSource.length > 0);
+}
+
+export interface BootstrapSplit {
+  groups: BootstrapEvidence[];
+  /**
+   * Size of the largest returned group, in tokens: the smallest budget at which
+   * this split is entirely feasible. Taken over every group, divisible ones
+   * included — when it exceeds the requested budget the excess is atomic and the
+   * caller must widen rather than split further.
+   */
+  minimumGroupTokens: number;
+  /**
+   * Number of halving OPERATIONS performed, not the number of candidates that
+   * were divided: dividing one candidate of 5 units into 5 parts counts 4.
+   */
+  subdivided: number;
+}
+
+/**
+ * Greedy over candidates; a candidate that does not fit an empty group is
+ * subdivided first. Themes and language evidence are duplicated into every
+ * group, which is the overhead the chunk budget already subtracts. Nothing is
+ * ever dropped or truncated: when a single evidence unit still does not fit,
+ * it is kept whole and `minimumGroupTokens` reports the budget it would need.
+ */
+export function splitBootstrapPayload(
+  value: BootstrapEvidence,
+  budget: number,
+  calibration?: number,
+): BootstrapSplit {
+  const estimate = (group: BootstrapEvidence): number => estimateBootstrapPayload(group, calibration);
+  const whole = estimate(value);
+  if (whole <= budget) return { groups: [value], minimumGroupTokens: whole, subdivided: 0 };
+
+  // Divide until every part fits or is atomic. `subdivideCandidate` halves by
+  // evidence unit, so the loop terminates: each pass either shrinks a part or
+  // reports it atomic. A single arithmetic pass is not enough — one unit can be
+  // far larger than the average, so ceil(size / budget) parts can still overflow.
+  let subdivided = 0;
+  const queue: BootstrapCandidateEvidence[] = [];
+  const pending = [...value.candidates];
+  while (pending.length > 0) {
+    const candidate = pending.shift()!;
+    const probe: BootstrapEvidence = { ...emptyBootstrapGroup(value), candidates: [candidate] };
+    if (estimate(probe) <= budget) {
+      queue.push(candidate);
+      continue;
+    }
+    const units = Math.max(candidate.facts.length, candidate.exactSource.length);
+    if (units <= 1) {
+      queue.push(candidate); // atomic: at most one fact and one range, cannot divide
+      continue;
+    }
+    subdivided++;
+    pending.unshift(...subdivideCandidate(candidate, 2));
+  }
+
+  const groups: BootstrapEvidence[] = [];
+  let current = emptyBootstrapGroup(value);
+  for (const candidate of queue) {
+    const attempt: BootstrapEvidence = { ...current, candidates: [...current.candidates, candidate] };
+    if (current.candidates.length > 0 && estimate(attempt) > budget) {
+      groups.push(current);
+      current = { ...emptyBootstrapGroup(value), candidates: [candidate] };
+      continue;
+    }
+    current = attempt;
+  }
+  groups.push(current);
+
+  return {
+    groups,
+    minimumGroupTokens: Math.max(...groups.map((group) => estimate(group))),
+    subdivided,
+  };
+}
+
+function rangeKey(range: EvidenceRange): string {
+  return `${range.startLine}:${range.endLine}`;
+}
+
+function assertLocalRange(range: EvidenceRange, chunk: EvidenceChunk): void {
+  const chunkLineCount = chunk.endLine - chunk.startLine + 1;
+  if (range.startLine > range.endLine
+    || range.startLine < 1
+    || range.endLine > chunkLineCount) {
+    throw new EvidenceCoverageError(
+      `Chunk-local evidence range ${range.startLine}-${range.endLine} is outside chunk ${chunk.id} lines 1-${chunkLineCount}`,
+    );
+  }
+}
+
+function globalRange(range: EvidenceRange, chunk: EvidenceChunk): EvidenceRange {
+  return {
+    startLine: chunk.startLine + range.startLine - 1,
+    endLine: chunk.startLine + range.endLine - 1,
+  };
+}
+
+function sourceLines(source: string | readonly string[]): readonly string[] {
+  return typeof source === "string" ? source.split("\n") : source;
+}
+
+function sourceForEvidence(source: string): string {
+  const lines = source.split("\n");
+  if (lines[0]?.replace(/\r$/, "").trim() !== "---") return source;
+  const frontmatterEnd = lines.findIndex((line, index) =>
+    index > 0 && line.replace(/\r$/, "").trim() === "---");
+  if (frontmatterEnd < 0) return source;
+
+  let redact = false;
+  for (let index = 1; index < frontmatterEnd; index++) {
+    const line = lines[index].replace(/\r$/, "");
+    const topLevelKey = /^([A-Za-z_][A-Za-z0-9_-]*):/.exec(line)?.[1];
+    if (topLevelKey !== undefined) {
+      redact = topLevelKey.startsWith("wiki_") || topLevelKey === "OutgoingLinks";
+    }
+    if (redact) lines[index] = lines[index].endsWith("\r") ? "\r" : "";
+  }
+  return lines.join("\n");
+}
+
+export function buildEvidenceCoverage(
+  chunkIds: string[],
+  packets: EvidencePacket[],
+  noEvidence: NoEvidence[],
+): Set<string> {
+  const expected = new Set(chunkIds);
+  if (expected.size !== chunkIds.length || chunkIds.some((id) => id.trim() === "")) {
+    throw new EvidenceCoverageError("Duplicate or blank source chunk ID");
+  }
+  const packetIds = new Set<string>();
+  const packetChunks = new Set<string>();
+  for (const packet of packets) {
+    try {
+      EvidencePacketSchema.parse({
+        id: packet.id,
+        chunkId: packet.chunkId,
+        entityKey: packet.entityKey,
+        entityType: packet.entityType,
+        facts: packet.facts,
+        exactSourceRanges: packet.exactSourceRanges,
+        links: packet.links,
+        sourceAnchor: packet.sourceAnchor,
+      });
+    } catch (error) {
+      throw new EvidenceCoverageError(
+        `Invalid evidence packet ${packet.id || "(blank)"}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    assertEntityKey(packet.entityKey);
+    if (packetIds.has(packet.id)) throw new EvidenceCoverageError(`Duplicate packet ID ${packet.id}`);
+    packetIds.add(packet.id);
+    if (!expected.has(packet.chunkId)) throw new EvidenceCoverageError(`Unknown source chunk ${packet.chunkId}`);
+    if (packetChunks.has(packet.chunkId)) {
+      // Multiple packets are valid; this set only tracks packet coverage.
+    }
+    packetChunks.add(packet.chunkId);
+  }
+  const noEvidenceChunks = new Set<string>();
+  for (const item of noEvidence) {
+    try { NoEvidenceSchema.parse(item); } catch (error) {
+      throw new EvidenceCoverageError(
+        `Invalid noEvidence result: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    if (noEvidenceChunks.has(item.chunkId)) {
+      throw new EvidenceCoverageError(`Duplicate noEvidence chunk ${item.chunkId}`);
+    }
+    if (!expected.has(item.chunkId)) throw new EvidenceCoverageError(`Unknown source chunk ${item.chunkId}`);
+    noEvidenceChunks.add(item.chunkId);
+  }
+  for (const chunkId of packetChunks) {
+    if (noEvidenceChunks.has(chunkId)) throw new EvidenceCoverageError(`Mixed packet/noEvidence coverage for ${chunkId}`);
+  }
+  const covered = new Set([...packetChunks, ...noEvidenceChunks]);
+  const missing = chunkIds.filter((id) => !covered.has(id));
+  if (missing.length > 0) throw new EvidenceCoverageError(`Missing source chunk coverage: ${missing.join(", ")}`);
+  return covered;
+}
+
+export function validateEvidenceMap(
+  input: { chunk: EvidenceChunk; packets: EvidencePacket[]; noEvidence: NoEvidence[] },
+  source?: string | readonly string[],
+): VerifiedEvidencePacket[] {
+  let parsed: z.infer<typeof EvidenceMapSchema>;
+  try {
+    parsed = EvidenceMapSchema.parse({
+      ...input,
+      chunk: {
+        id: input.chunk.id,
+        startLine: input.chunk.startLine,
+        endLine: input.chunk.endLine,
+      },
+    });
+  } catch (error) {
+    throw new EvidenceCoverageError(
+      `Invalid evidence map for chunk ${input.chunk.id}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  if (parsed.chunk.startLine > parsed.chunk.endLine) {
+    throw new EvidenceCoverageError(`Invalid range for chunk ${parsed.chunk.id}`);
+  }
+  buildEvidenceCoverage([parsed.chunk.id], parsed.packets, parsed.noEvidence);
+  const lines = source === undefined ? undefined : sourceLines(source);
+  return parsed.packets.map((packet) => {
+    assertEntityKey(packet.entityKey);
+    const exactSourceRanges = packet.exactSourceRanges.map((range) => {
+      assertLocalRange(range, parsed.chunk);
+      return globalRange(range, parsed.chunk);
+    });
+    const exactSource = exactSourceRanges.map((range) => {
+      if (lines === undefined) {
+        throw new EvidenceCoverageError("Original source is required to verify exact evidence");
+      }
+      if (range.endLine > lines.length) {
+        throw new EvidenceCoverageError(`Evidence range ${rangeKey(range)} is outside source`);
+      }
+      return {
+        ...range,
+        text: lines.slice(range.startLine - 1, range.endLine).join("\n"),
+      };
+    });
+    return { ...packet, exactSourceRanges, exactSource };
+  });
+}
+
+export function dedupeEvidencePackets(packets: EvidencePacket[]): PreVerifiedEntityEvidence {
+  if (packets.length === 0) throw new EvidenceReducerError("Cannot reduce empty evidence packet list");
+  const ids = new Set<string>();
+  const first = packets[0];
+  assertEntityKey(first.entityKey);
+  const entityType = first.entityType;
+  const facts: string[] = [];
+  const ranges: EvidenceRange[] = [];
+  const links: string[] = [];
+  for (const packet of packets) {
+    EvidencePacketSchema.parse({
+      id: packet.id,
+      chunkId: packet.chunkId,
+      entityKey: packet.entityKey,
+      entityType: packet.entityType,
+      facts: packet.facts,
+      exactSourceRanges: packet.exactSourceRanges,
+      links: packet.links,
+      sourceAnchor: packet.sourceAnchor,
+    });
+    if (ids.has(packet.id)) throw new EvidenceReducerError(`Duplicate packet ID ${packet.id}`);
+    ids.add(packet.id);
+    if (packet.entityKey !== first.entityKey || packet.entityType !== entityType) {
+      throw new EvidenceReducerError("Mixed entity packets cannot be reduced together");
+    }
+    assertEntityKey(packet.entityKey);
+    facts.push(...packet.facts);
+    ranges.push(...packet.exactSourceRanges);
+    links.push(...packet.links);
+  }
+  return {
+    entityKey: first.entityKey,
+    ...(entityType === undefined ? {} : { entityType }),
+    packetIds: [...ids],
+    facts: unique(facts, (fact) => fact),
+    exactSourceRanges: unique(ranges, rangeKey),
+    links: unique(links, (link) => link),
+  };
+}
+
+export function dedupeVerifiedEvidencePackets(packets: VerifiedEvidencePacket[]): EntityEvidence {
+  if (packets.length === 0) throw new EvidenceReducerError("Cannot reduce empty evidence packet list");
+  const preVerified = dedupeEvidencePackets(packets);
+  const exactSource = unique(
+    packets.flatMap((packet) => packet.exactSource),
+    (range) => `${rangeKey(range)}:${range.text}`,
+  );
+  const result: EntityEvidence = { ...preVerified, exactSource };
+  try { EntityEvidenceSchema.parse(result); } catch (error) {
+    throw new EvidenceReducerError(error instanceof Error ? error.message : "Invalid verified evidence aggregate");
+  }
+  return result;
+}
+
+export function validateReducedEvidence(
+  consumed: Array<EvidencePacket | VerifiedEvidencePacket>,
+  reduced: EntityEvidence | PreVerifiedEntityEvidence,
+): EntityEvidence | PreVerifiedEntityEvidence {
+  const verifiedFlags = consumed.map((packet) => "exactSource" in packet);
+  const verified = verifiedFlags.every(Boolean);
+  if (verifiedFlags.some((value) => value !== verified)) {
+    throw new EvidenceReducerError("Mixed verification state in consumed evidence packets");
+  }
+  try {
+    (verified ? EntityEvidenceSchema : PreVerifiedEntityEvidenceSchema).parse(reduced);
+  } catch (error) {
+    throw new EvidenceReducerError(error instanceof Error ? error.message : "Invalid reduced evidence");
+  }
+  const expected = verified
+    ? dedupeVerifiedEvidencePackets(consumed.filter(
+      (packet): packet is VerifiedEvidencePacket => "exactSource" in packet,
+    ))
+    : dedupeEvidencePackets(consumed.filter((packet) => !("exactSource" in packet)));
+  if (reduced.packetIds.length !== expected.packetIds.length
+    || new Set(reduced.packetIds).size !== reduced.packetIds.length
+    || reduced.packetIds.some((id, index) => id !== expected.packetIds[index])) {
+    const missing = expected.packetIds.filter((id) => !reduced.packetIds.includes(id));
+    throw new EvidenceReducerError(
+      `Reduced evidence does not account for every consumed packet ID: ${missing.join(", ") || "unexpected IDs"}`,
+    );
+  }
+  if (reduced.entityKey !== expected.entityKey || reduced.entityType !== expected.entityType) {
+    throw new EvidenceReducerError("Reduced evidence changed entity identity");
+  }
+  if (JSON.stringify(reduced.facts) !== JSON.stringify(expected.facts)) throw new EvidenceReducerError("Reduced evidence contains unsupported facts");
+  if (JSON.stringify(reduced.exactSourceRanges) !== JSON.stringify(expected.exactSourceRanges)) throw new EvidenceReducerError("Reduced evidence changed exact source ranges");
+  if (JSON.stringify(reduced.links) !== JSON.stringify(expected.links)) throw new EvidenceReducerError("Reduced evidence contains unsupported links");
+  if (verified && JSON.stringify((reduced as EntityEvidence).exactSource)
+    !== JSON.stringify((expected as EntityEvidence).exactSource)) {
+    throw new EvidenceReducerError("Reduced evidence changed exact source");
+  }
+  return reduced;
+}
+
+export interface EvidencePolicy {
+  inputBudgetTokens: number;
+  outputBudgetTokens?: number;
+  compressionProfile?: CompressionProfile;
+  compression?: CompressionProfile;
+  overlapLines?: number;
+  mapperRetries?: number;
+  reducerRetries?: number;
+  maxReductionDepth?: number;
+  bootstrapPayloadBudgetTokens?: number;
+  /** Calibrated token ceiling for one mapper source chunk. */
+  chunkBudgetTokens?: number;
+  /** Token calibration factor the budgets above are expressed in. */
+  calibration?: number;
+}
+
+export interface EvidenceRuntime {
+  llm: LlmClient;
+  model: string;
+  opts?: LlmCallOptions;
+  signal?: AbortSignal;
+  onEvent?: (event: RunEvent) => void;
+  configuredEntityTypes?: string[];
+  mapCallSite?: "ingest.evidence-map" | "init.bootstrap-map";
+}
+
+export interface BootstrapCandidateEvidence {
+  entityKey: string;
+  packetIds: string[];
+  facts: string[];
+  exactSource: Array<EvidenceRange & { text: string }>;
+}
+
+export interface BootstrapEvidence {
+  candidates: BootstrapCandidateEvidence[];
+  domainThemes: string[];
+  languageEvidence: string[];
+}
+
+export interface BootstrapEvidenceBundle {
+  bootstrap: BootstrapEvidence;
+  bootstrapGroups: BootstrapEvidence[];
+  bootstrapMinimumGroupTokens: number;
+  bootstrapSubdivided: number;
+  evidence: EntityEvidence[];
+  domainId: string;
+  sourcePath: string;
+  sourceBodyHash: string;
+}
+
+interface EvidenceMappingMode {
+  allowedEntityTypes?: Set<string>;
+  rejectEntityTypes: boolean;
+}
+
+type EvidenceUnit = VerifiedEvidencePacket | EntityEvidence;
+
+function isEntityEvidence(unit: EvidenceUnit): unit is EntityEvidence {
+  return "packetIds" in unit;
+}
+
+function packetIdsOf(unit: EvidenceUnit): string[] {
+  return isEntityEvidence(unit) ? unit.packetIds : [unit.id];
+}
+
+function evidenceFromUnits(units: EvidenceUnit[]): EntityEvidence {
+  if (units.length === 0) throw new EvidenceReducerError("Cannot aggregate an empty evidence batch");
+  const first = units[0];
+  const entityKey = first.entityKey;
+  const entityType = first.entityType;
+  const packetIds: string[] = [];
+  const facts: string[] = [];
+  const ranges: EvidenceRange[] = [];
+  const exactSource: Array<EvidenceRange & { text: string }> = [];
+  const links: string[] = [];
+  const ids = new Set<string>();
+  for (const unit of units) {
+    if (unit.entityKey !== entityKey || unit.entityType !== entityType) {
+      throw new EvidenceReducerError("Mixed entity packets cannot be reduced together");
+    }
+    for (const id of packetIdsOf(unit)) {
+      if (ids.has(id)) throw new EvidenceReducerError(`Duplicate consumed packet ID ${id}`);
+      ids.add(id);
+      packetIds.push(id);
+    }
+    facts.push(...unit.facts);
+    ranges.push(...unit.exactSourceRanges);
+    exactSource.push(...unit.exactSource);
+    links.push(...unit.links);
+  }
+  return {
+    entityKey,
+    ...(entityType === undefined ? {} : { entityType }),
+    packetIds,
+    facts: unique(facts, (fact) => fact),
+    exactSourceRanges: unique(ranges, rangeKey),
+    exactSource: unique(exactSource, (range) => `${rangeKey(range)}:${range.text}`),
+    links: unique(links, (link) => link),
+  };
+}
+
+function addSchemaIssue(ctx: z.RefinementCtx, message: string): void {
+  ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+}
+
+const EvidenceRangeWireSchema = z.preprocess((value) => {
+  if (Array.isArray(value) && value.length === 2) {
+    const tuple = value as unknown[];
+    return { startLine: tuple[0], endLine: tuple[1] };
+  }
+  return value;
+}, EvidencePacketSchema.shape.exactSourceRanges.element);
+
+const EvidencePacketWireObjectSchema = EvidencePacketSchema.extend({
+  entityType: EvidencePacketSchema.shape.entityType.nullable()
+    .transform((entityType) => entityType ?? undefined),
+  exactSourceRanges: z.array(EvidenceRangeWireSchema).min(1),
+});
+
+const EvidencePacketWireSchema = z.preprocess((value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (record.exactSourceRanges !== undefined || record.exactSourceRange === undefined) return value;
+  const { exactSourceRange, ...withoutSingularRange } = record;
+  return { ...withoutSingularRange, exactSourceRanges: [exactSourceRange] };
+}, EvidencePacketWireObjectSchema).transform((packet): EvidencePacket => {
+  const { entityType, ...withoutEntityType } = packet;
+  return entityType === undefined ? withoutEntityType : { ...withoutEntityType, entityType };
+});
+
+const EvidenceMapperWireOutputSchema = EvidenceMapperOutputSchema.extend({
+  packets: z.array(EvidencePacketWireSchema),
+});
+
+function noEvidenceWireSchemaFor(chunkId: string): z.ZodSchema<NoEvidence> {
+  return z.preprocess((value) => {
+    if (typeof value === "string") return { chunkId, reason: value };
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      const { summary, ...withoutSummary } = record;
+      return {
+        ...withoutSummary,
+        reason: record.reason === undefined
+          && typeof summary === "string"
+          && summary.trim() !== ""
+            ? summary
+            : record.reason,
+      };
+    }
+    return value;
+  }, NoEvidenceSchema) as z.ZodSchema<NoEvidence>;
+}
+
+const UntypedEntityEvidenceWireSchema = EntityEvidenceSchema.extend({
+  entityType: EntityEvidenceSchema.shape.entityType.nullable()
+    .transform((entityType) => entityType ?? undefined),
+}).transform((evidence): EntityEvidence => {
+  const { entityType, ...withoutEntityType } = evidence;
+  return entityType === undefined ? withoutEntityType : { ...withoutEntityType, entityType };
+});
+
+function structuredWireSchema<T>(
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>,
+): z.ZodSchema<T> {
+  return schema as unknown as z.ZodSchema<T>;
+}
+
+function mapperSchemaFor(chunk: SourceChunk, mode: EvidenceMappingMode) {
+  const schema = z.preprocess((value) => {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      const declaredPacketIds = new Set(
+        (Array.isArray(record.packets) ? record.packets : [])
+          .map((packet) => packet && typeof packet === "object" && !Array.isArray(packet)
+            ? (packet as Record<string, unknown>).id
+            : undefined)
+          .filter((id): id is string => typeof id === "string" && id.trim() !== ""),
+      );
+      const usedPacketIds = new Set<string>();
+      let generatedPacketOrdinal = 1;
+      const nextPacketId = (): string => {
+        let candidate: string;
+        do {
+          candidate = `p${generatedPacketOrdinal}`;
+          generatedPacketOrdinal += 1;
+        } while (declaredPacketIds.has(candidate) || usedPacketIds.has(candidate));
+        return candidate;
+      };
+      const packets = Array.isArray(record.packets)
+        ? record.packets.map((packet: unknown) => {
+          if (!packet || typeof packet !== "object" || Array.isArray(packet)) return packet;
+          const packetRecord = packet as Record<string, unknown>;
+          const declaredId = typeof packetRecord.id === "string" && packetRecord.id.trim() !== ""
+            ? packetRecord.id
+            : undefined;
+          const id = declaredId !== undefined && !usedPacketIds.has(declaredId)
+            ? declaredId
+            : nextPacketId();
+          usedPacketIds.add(id);
+          return { ...packetRecord, id };
+        })
+        : record.packets;
+      const hasPackets = Array.isArray(record.packets) && record.packets.length > 0;
+      const hasNoEvidence = Array.isArray(record.noEvidence) && record.noEvidence.length > 0;
+      return {
+        ...record,
+        ...(record.packets === undefined && hasNoEvidence ? { packets: [] } : { packets }),
+        ...(record.noEvidence === undefined && hasPackets ? { noEvidence: [] } : {}),
+      };
+    }
+    return value;
+  }, EvidenceMapperWireOutputSchema.extend({
+    noEvidence: z.array(noEvidenceWireSchemaFor(chunk.id)),
+  }));
+  return structuredWireSchema(schema.superRefine((value, ctx) => {
+    try {
+      if (value.packets.length === 0 && value.noEvidence.length === 0) {
+        throw new EvidenceCoverageError("Evidence map must assign packets or explicit noEvidence");
+      }
+      buildEvidenceCoverage([chunk.id], value.packets, value.noEvidence);
+      for (const packet of value.packets) {
+        assertEntityKey(packet.entityKey);
+        if (mode.rejectEntityTypes && packet.entityType !== undefined) {
+          throw new EvidenceCoverageError("entityType is not allowed without configured entity types");
+        }
+        if (packet.entityType !== undefined
+          && mode.allowedEntityTypes !== undefined
+          && !mode.allowedEntityTypes.has(packet.entityType)) {
+          throw new EvidenceCoverageError(`Unknown configured entity type "${packet.entityType}"`);
+        }
+        for (const range of packet.exactSourceRanges) assertLocalRange(range, chunk);
+      }
+    } catch (error) {
+      addSchemaIssue(ctx, error instanceof Error ? error.message : "Invalid evidence map");
+    }
+  }));
+}
+
+function reducerSchemaFor(expected: EntityEvidence) {
+  const wireSchema = expected.entityType === undefined
+    ? UntypedEntityEvidenceWireSchema
+    : EntityEvidenceSchema;
+  return structuredWireSchema(wireSchema.superRefine((value, ctx) => {
+    try { assertReducedEntity(expected, value); } catch (error) {
+      addSchemaIssue(ctx, error instanceof Error ? error.message : "Invalid reduced evidence");
+    }
+  }));
+}
+
+function assertReducedEntity(expected: EntityEvidence, actual: EntityEvidence): void {
+  if (actual.entityKey !== expected.entityKey || actual.entityType !== expected.entityType) {
+    throw new EvidenceReducerError("Reduced evidence changed entity identity");
+  }
+  if (actual.packetIds.length !== expected.packetIds.length
+    || new Set(actual.packetIds).size !== actual.packetIds.length
+    || actual.packetIds.some((id, index) => id !== expected.packetIds[index])) {
+    const missing = expected.packetIds.filter((id) => !actual.packetIds.includes(id));
+    throw new EvidenceReducerError(`Reduced evidence packet coverage mismatch: ${missing.join(", ") || "extra IDs"}`);
+  }
+  if (JSON.stringify(actual.facts) !== JSON.stringify(expected.facts)) {
+    throw new EvidenceReducerError("Reduced evidence contains invented or missing facts");
+  }
+  if (JSON.stringify(actual.exactSourceRanges) !== JSON.stringify(expected.exactSourceRanges)) {
+    throw new EvidenceReducerError("Reduced evidence contains invented or missing exact source ranges");
+  }
+  if (JSON.stringify(actual.exactSource) !== JSON.stringify(expected.exactSource)) {
+    throw new EvidenceReducerError("Reduced evidence changed exact source");
+  }
+  if (JSON.stringify(actual.links) !== JSON.stringify(expected.links)) {
+    throw new EvidenceReducerError("Reduced evidence contains invented or missing links");
+  }
+}
+
+function compressionOf(policy: EvidencePolicy): CompressionProfile {
+  return policy.compressionProfile ?? policy.compression ?? "balanced";
+}
+
+function messagesForMapper(
+  prompt: string,
+  chunk: SourceChunk,
+  domainId: string,
+  mode: EvidenceMappingMode,
+  preparedSourceLines: readonly string[],
+): OpenAI.Chat.ChatCompletionMessageParam[] {
+  const configuredTypes = mode.rejectEntityTypes
+    ? "none"
+    : mode.allowedEntityTypes === undefined
+      ? "unspecified"
+      : [...mode.allowedEntityTypes].join(", ") || "none";
+  const originalLines = preparedSourceLines.slice(chunk.startLine - 1, chunk.endLine);
+  const numberedLines = originalLines.map((line, index) => `CHUNK_LINE ${index + 1} | ${line}`);
+  return [
+    { role: "system", content: prompt.replace("{{domain_name}}", domainId) },
+    {
+      role: "user",
+      content: `CONFIGURED_ENTITY_TYPES ${configuredTypes}\nCHUNK_ID ${chunk.id} START ${chunk.startLine} END ${chunk.endLine}\nSOURCE CHUNK:\n${numberedLines.join("\n")}`,
+    },
+  ];
+}
+
+interface MapperRequestDetails {
+  hash: string;
+  estimatedInputTokens: number;
+  rawTokens: number;
+  lineCount: number;
+}
+
+type SourceChunkRangeFactory = ReturnType<typeof createSourceChunkRangeFactory>;
+
+interface MapperChunkWork {
+  chunk: SourceChunk;
+  splitDepth: 0 | 1;
+}
+
+function mapperRequestDetails(
+  preparedSourceLines: readonly string[],
+  chunk: SourceChunk,
+  domainId: string,
+  mode: EvidenceMappingMode,
+  policy: EvidencePolicy,
+  opts: LlmCallOptions,
+): MapperRequestDetails {
+  const messages = messagesForMapper(mapPrompt, chunk, domainId, mode, preparedSourceLines);
+  const mapperOpts = taskLlmOptions(opts, policy, policy.inputBudgetTokens);
+  const prepared = prepareChatMessages(messages, mapperOpts);
+  const original = preparedSourceLines.slice(chunk.startLine - 1, chunk.endLine).join("\n");
+  return {
+    hash: JSON.stringify(prepared),
+    estimatedInputTokens: estimateStructuredRequest(messages, mapperOpts, policy.mapperRetries ?? 1),
+    rawTokens: estimateText(original),
+    lineCount: chunk.endLine - chunk.startLine + 1,
+  };
+}
+
+function estimateLlmMessages(
+  messages: OpenAI.Chat.ChatCompletionMessageParam[],
+  opts: LlmCallOptions,
+): number {
+  return estimatePreparedMessages(prepareChatMessages(messages, opts), opts.tokenCalibration);
+}
+
+function boundedStructuredRepairInstruction(error?: Error): string {
+  const unboundedDetail = error instanceof z.ZodError
+    ? error.issues.slice(0, 12).map((issue) => {
+      const path = issue.path.length ? issue.path.join(".") : "(root)";
+      return `${evidenceValidationReason(issue)} @ ${path}`;
+    }).join("\n")
+    : error?.message;
+  const detail = unboundedDetail === undefined
+    ? undefined
+    : boundStructuredRepairDetail(unboundedDetail);
+  return [
+    "STRUCTURED_REPAIR:",
+    detail,
+    "Return <<<JSON>>>...<<<END>>>; exact chunkId; chunk-local CHUNK_LINE ranges.",
+  ].filter(Boolean).join("\n");
+}
+
+function boundStructuredRepairDetail(detail: string): string {
+  const normalized = detail.replace(/\p{Cc}+/gu, " ").replace(/\s+/gu, " ").trim();
+  let bytes = 0;
+  let bounded = "";
+  for (const character of normalized) {
+    const characterBytes = structuredRepairEncoder.encode(character).byteLength;
+    if (bytes + characterBytes > STRUCTURED_REPAIR_DETAIL_MAX_BYTES) break;
+    bounded += character;
+    bytes += characterBytes;
+  }
+  return bounded;
+}
+
+function evidenceValidationReason(issue: z.ZodIssue): string {
+  const message = issue.message.replace(/\s+/g, " ").trim().slice(0, 320);
+  const lower = message.toLowerCase();
+  const code = lower.includes("unknown source chunk")
+    ? "unknown_source_chunk"
+    : lower.includes("chunk coverage") || lower.includes("missing chunk") || lower.includes("covered by both")
+      ? "chunk_coverage_mismatch"
+      : lower.includes("entitytype is not allowed")
+        ? "entity_type_forbidden"
+        : lower.includes("unknown configured entity type")
+          ? "unknown_entity_type"
+          : lower.includes("normalized entity key")
+            ? "invalid_entity_key"
+            : lower.includes("range") && lower.includes("outside chunk")
+              ? "source_range_out_of_bounds"
+              : issue.code;
+  return `${code}: ${message}`;
+}
+
+function structuredRepairMessages(
+  messages: OpenAI.Chat.ChatCompletionMessageParam[],
+  error?: Error,
+): OpenAI.Chat.ChatCompletionMessageParam[] {
+  return [
+    ...messages,
+    { role: "user", content: boundedStructuredRepairInstruction(error) },
+  ];
+}
+
+function outputLimitStructuredRepairMessages(
+  messages: OpenAI.Chat.ChatCompletionMessageParam[],
+  error: Error,
+): OpenAI.Chat.ChatCompletionMessageParam[] {
+  return [
+    ...messages,
+    {
+      role: "user",
+      content: [
+        "OUTPUT LIMIT RETRY.",
+        boundedStructuredRepairInstruction(error),
+      ].join("\n"),
+    },
+  ];
+}
+
+function estimateStructuredRequest(
+  messages: OpenAI.Chat.ChatCompletionMessageParam[],
+  opts: LlmCallOptions,
+  retries: number,
+): number {
+  const base = estimateLlmMessages(messages, opts);
+  if (retries <= 0) return base;
+  const worstCaseDetail = new Error("\\".repeat(STRUCTURED_REPAIR_DETAIL_MAX_BYTES));
+  return Math.max(
+    base,
+    estimateLlmMessages(structuredRepairMessages(messages, worstCaseDetail), opts),
+    estimateLlmMessages(outputLimitStructuredRepairMessages(messages, worstCaseDetail), opts),
+  );
+}
+
+async function runBoundedStructuredWithRetry<T>(
+  args: RunStructuredArgs<T>,
+): Promise<RunStructuredResult<T>> {
+  let messages = args.baseMessages;
+  let currentOpts = args.opts;
+  for (let attempt = 0; attempt <= args.maxRetries; attempt++) {
+    try {
+      return await runStructuredWithRetry({
+        ...args,
+        baseMessages: messages,
+        opts: currentOpts,
+        maxRetries: 0,
+        lifecycle: attempt === 0
+          ? args.lifecycle
+          : { ...args.lifecycle, id: `${args.lifecycle.id}:bounded-${attempt}` },
+        validationExhaustionPhase: attempt === args.maxRetries ? "failed" : "retrying",
+      });
+    } catch (error) {
+      if (!(error instanceof StructuredValidationError)) throw error;
+      if (attempt === args.maxRetries) {
+        throw new StructuredValidationError(
+          args.callSite,
+          args.maxRetries + 1,
+          error.lastError,
+          error.errorType,
+          error.outputTokens,
+        );
+      }
+      if (error.errorType === "output_limit") {
+        currentOpts = outputRetryOptions(
+          currentOpts,
+          error.outputTokens ?? currentOpts.maxTokens ?? 0,
+        );
+        messages = outputLimitStructuredRepairMessages(args.baseMessages, error.lastError);
+      } else {
+        messages = structuredRepairMessages(args.baseMessages, error.lastError);
+      }
+    }
+  }
+  throw new Error("unreachable bounded structured retry state");
+}
+
+function forwardEvidenceStructuredEvent(
+  runtime: EvidenceRuntime,
+  event: RunEvent,
+): void {
+  if (event.kind === "structural_error") {
+    runtime.onEvent?.({
+      ...event,
+      message: sanitizeStructuralDiagnostic(event.message),
+    });
+  } else if (
+    event.kind === "llm_lifecycle"
+    || event.kind === "assistant_text"
+    || event.kind === "rule_fired"
+    || event.kind === "llm_call_stats"
+    || event.kind === "llm_request_fingerprint"
+    || event.kind === "transport_retry_scheduled"
+    || event.kind === "transport_retry_recovered"
+    || event.kind === "transport_retry_exhausted"
+    || event.kind === "native_transport_correlation"
+    || event.kind === "native_http_response"
+    || event.kind === "native_transport_trace"
+    || event.kind === "prompt_budget"
+  ) {
+    runtime.onEvent?.(event);
+  }
+}
+
+function sanitizeStructuralDiagnostic(message: string): string {
+  return message
+    .replace(/"[^"\n]{24,}"/g, "\"[redacted]\"")
+    .replace(/\b[A-Z0-9_]{16,}\b/g, "[redacted]");
+}
+
+function taskLlmOptions(
+  opts: LlmCallOptions,
+  policy: EvidencePolicy,
+  inputBudgetTokens: number,
+): LlmCallOptions {
+  const result: LlmCallOptions = {
+    ...opts,
+    inputBudgetTokens,
+    semanticCompression: { profile: compressionOf(policy), operation: "ingest" },
+  };
+  if (policy.outputBudgetTokens !== undefined) result.maxTokens = policy.outputBudgetTokens;
+  return result;
+}
+
+function assertReducerOutputFits(
+  units: EvidenceUnit[],
+  depth: number,
+  outputBudget?: number,
+): void {
+  if (outputBudget === undefined) return;
+  const expectedBytes = new TextEncoder().encode(JSON.stringify(evidenceFromUnits(units))).byteLength;
+  const outputBytes = outputBudget;
+  if (expectedBytes > outputBytes) {
+    throw new EvidenceReducerError(
+      `Reducer expected output at depth ${depth} requires ${expectedBytes} bytes and exceeds ${outputBytes} byte output budget`,
+    );
+  }
+}
+
+export function chunkSourceForEvidence(
+  source: string,
+  domainId: string,
+  policy: EvidencePolicy,
+  opts: LlmCallOptions = {},
+  configuredEntityTypes?: string[],
+): SourceChunk[] {
+  ensurePolicy(policy, opts);
+  if (source.length === 0) return [];
+  const normalizedEntityTypes = configuredEntityTypes ?? [];
+  const mode: EvidenceMappingMode = {
+    rejectEntityTypes: normalizedEntityTypes.length === 0,
+    allowedEntityTypes: new Set(normalizedEntityTypes),
+  };
+  return planSourceChunksForEvidence(
+    source,
+    sourceLines(source),
+    createSourceChunkRangeFactory(source),
+    domainId,
+    policy,
+    opts,
+    mode,
+  );
+}
+
+function planSourceChunksForEvidence(
+  source: string,
+  preparedSourceLines: readonly string[],
+  createChunk: SourceChunkRangeFactory,
+  domainId: string,
+  policy: EvidencePolicy,
+  opts: LlmCallOptions,
+  mode: EvidenceMappingMode,
+): SourceChunk[] {
+  const initialRequestBudget = policy.inputBudgetTokens;
+  if (initialRequestBudget <= 0) {
+    throw new EvidenceCoverageError("Mapper prompt and repair reserve exceed the input budget");
+  }
+  // policy.chunkBudgetTokens is expressed in calibrated tokens, the same unit as
+  // the bootstrap payload budget. chunkMarkdownSource measures in raw estimator
+  // tokens, so the budget is converted rather than the measurement. Without this
+  // the "one evidence unit always fits" proof compares two different scales.
+  //
+  // This is not inert when chunkBudgetTokens is unset. Two regimes matter:
+  //   - opts.tokenCalibration below 1 (model-context clamps to [0.5, 3], so 0.5
+  //     is reachable) shrinks the calibrated request estimate, letting
+  //     mapperEstimateFits admit roughly 1/calibration times more raw markdown
+  //     than inputBudgetTokens. The raw ceiling then binds where nothing bound
+  //     before. That is intended: the ceiling keeps a chunk's raw text within
+  //     the configured budget instead of trusting a factor fitted for whole
+  //     requests, it only ever produces smaller chunks, and coverage is
+  //     unaffected, so it costs an extra mapper call and loses nothing.
+  //   - policy.calibration below 1 widens the ceiling instead, because a
+  //     calibrated budget buys proportionally more raw tokens.
+  const rawChunkBudget = Math.max(1, Math.floor(
+    Math.min(initialRequestBudget, policy.chunkBudgetTokens ?? initialRequestBudget)
+    / (policy.calibration ?? 1),
+  ));
+  const planned = findLargestFeasibleBudget<SourceChunk[]>(1, rawChunkBudget, (chunkBudget) => {
+    let chunks: SourceChunk[];
+    try {
+      chunks = chunkMarkdownSource(source, {
+        maxEstimatedTokens: chunkBudget,
+        overlapLines: policy.overlapLines ?? 0,
+      });
+    } catch {
+      return { kind: "too-small" as const };
+    }
+    const mapperOpts = taskLlmOptions(opts, policy, policy.inputBudgetTokens);
+    // Packing merges adjacent chunks, so it has to respect the raw chunk budget
+    // too; otherwise the bound the search just applied is immediately undone.
+    chunks = packAdjacentMapperChunks(chunks, createChunk, (chunk) => estimateText(chunk.markdown) <= rawChunkBudget
+      && mapperEstimateFits(
+        estimateStructuredRequest(
+          messagesForMapper(mapPrompt, chunk, domainId, mode, preparedSourceLines),
+          mapperOpts,
+          policy.mapperRetries ?? 1,
+        ),
+        initialRequestBudget,
+      ));
+    const estimates = chunks.map((chunk) => estimateStructuredRequest(
+      messagesForMapper(mapPrompt, chunk, domainId, mode, preparedSourceLines),
+      mapperOpts,
+      policy.mapperRetries ?? 1,
+    ));
+    const largest = Math.max(...estimates);
+    return mapperEstimateFits(largest, initialRequestBudget)
+      ? { kind: "feasible" as const, value: chunks }
+      : { kind: "too-large" as const };
+  });
+  if (planned !== undefined) return planned.value;
+  throw new EvidenceCoverageError("Unable to derive a bounded mapper chunk size from the prepared request estimator");
+}
+
+function messagesForReducer(units: EvidenceUnit[]): OpenAI.Chat.ChatCompletionMessageParam[] {
+  return [
+    { role: "system", content: `${reducePrompt}\nREDUCE_EVIDENCE` },
+    { role: "user", content: `REDUCE_INPUT ${JSON.stringify(units)}` },
+  ];
+}
+
+function ensurePolicy(policy: EvidencePolicy, opts?: LlmCallOptions): void {
+  if (!Number.isSafeInteger(policy.inputBudgetTokens) || policy.inputBudgetTokens <= 0) {
+    throw new EvidenceCoverageError("Evidence input budget must be a positive safe integer");
+  }
+  if (policy.outputBudgetTokens !== undefined
+    && (!Number.isSafeInteger(policy.outputBudgetTokens) || policy.outputBudgetTokens <= 0)) {
+    throw new EvidenceCoverageError("Evidence output budget must be a positive safe integer");
+  }
+  if (policy.chunkBudgetTokens !== undefined
+    && (!Number.isSafeInteger(policy.chunkBudgetTokens) || policy.chunkBudgetTokens <= 0)) {
+    throw new EvidenceCoverageError("Evidence chunk budget must be a positive safe integer");
+  }
+  // A calibration of zero would make the raw chunk budget infinite and hang the
+  // budget search, so it is rejected rather than clamped.
+  if (policy.calibration !== undefined
+    && (!Number.isFinite(policy.calibration) || policy.calibration <= 0)) {
+    throw new EvidenceCoverageError("Evidence token calibration must be a positive finite number");
+  }
+  // The policy's budgets and the request estimates must be expressed in the same
+  // calibrated unit. A caller that threads the factor into the call options but not
+  // into the policy silently compares a calibrated budget against a raw measurement,
+  // so the mismatch is rejected here instead of producing a wrong chunk ceiling.
+  if (opts !== undefined && (policy.calibration ?? 1) !== (opts.tokenCalibration ?? 1)) {
+    throw new EvidenceCoverageError(
+      `Evidence policy calibration ${policy.calibration ?? 1} does not match the call `
+      + `calibration ${opts.tokenCalibration ?? 1}`,
+    );
+  }
+}
+
+function mapperEstimateFits(estimate: number, budget: number): boolean {
+  return estimate + MAPPER_ESTIMATE_SAFETY_TOKENS <= budget;
+}
+
+function ensureOutputBudget(policy: EvidencePolicy, opts: LlmCallOptions | undefined): void {
+  if (policy.outputBudgetTokens !== undefined
+    && opts?.maxTokens !== undefined
+    && opts.maxTokens !== policy.outputBudgetTokens) {
+    throw new EvidenceCoverageError(
+      `runtime.opts.maxTokens ${opts.maxTokens} conflicts with outputBudgetTokens ${policy.outputBudgetTokens}`,
+    );
+  }
+}
+
+export function findLargestFeasibleBudget<T>(
+  minimum: number,
+  maximum: number,
+  evaluate: (budget: number) =>
+    | { kind: "too-small" }
+    | { kind: "too-large" }
+    | { kind: "feasible"; value: T },
+): { budget: number; value: T } | undefined {
+  let low = minimum;
+  let high = maximum;
+  let feasible: { budget: number; value: T } | undefined;
+  while (low <= high) {
+    const budget = low + Math.floor((high - low) / 2);
+    const result = evaluate(budget);
+    if (result.kind === "too-small") low = budget + 1;
+    else if (result.kind === "too-large") high = budget - 1;
+    else {
+      feasible = { budget, value: result.value };
+      low = budget + 1;
+    }
+  }
+  return feasible;
+}
+
+interface RequestTelemetry {
+  callSite: "ingest.evidence-map" | "ingest.evidence-reduce" | "init.bootstrap-map";
+  configuredInputBudget: number;
+  effectiveInputBudget: number;
+  outputBudget?: number;
+  compressionProfile: CompressionProfile;
+  contextUnits: number;
+  sourceChunks: number;
+  reductionDepth: number;
+}
+
+function llmWithRequestTelemetry(
+  runtime: EvidenceRuntime,
+  metadata: RequestTelemetry,
+): LlmClient {
+  const completions = runtime.llm.chat.completions;
+  let pendingRequestId: string | undefined;
+  function createWithTelemetry(
+    params: OpenAI.Chat.ChatCompletionCreateParamsStreaming,
+    requestOpts?: LlmChatCompletionCreateOptions,
+  ): Promise<AsyncIterable<OpenAI.Chat.ChatCompletionChunk>>;
+  function createWithTelemetry(
+    params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+    requestOpts?: LlmChatCompletionCreateOptions,
+  ): Promise<OpenAI.Chat.ChatCompletion>;
+  async function createWithTelemetry(
+    params:
+      | OpenAI.Chat.ChatCompletionCreateParamsStreaming
+      | OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+    requestOpts?: LlmChatCompletionCreateOptions,
+  ): Promise<AsyncIterable<OpenAI.Chat.ChatCompletionChunk> | OpenAI.Chat.ChatCompletion> {
+    const estimatedInputTokens = estimatePreparedMessages(params.messages);
+    if (estimatedInputTokens > metadata.effectiveInputBudget) {
+      throw new PromptBudgetExceededError(
+        metadata.effectiveInputBudget,
+        estimatedInputTokens,
+        [],
+      );
+    }
+    const requestId = pendingRequestId;
+    pendingRequestId = undefined;
+    if (!requestId) {
+      throw new Error(`Missing requestId for ${metadata.callSite} prompt budget telemetry`);
+    }
+    let error: unknown;
+    try {
+      return params.stream
+        ? await completions.create(params, requestOpts)
+        : await completions.create(params, requestOpts);
+    } catch (caught) {
+      error = caught;
+      throw caught;
+    } finally {
+      const event = createPromptBudgetEvent({
+        requestId,
+        callSite: metadata.callSite,
+        configuredInputBudget: metadata.configuredInputBudget,
+        effectiveInputBudget: metadata.effectiveInputBudget,
+        estimatedInputTokens,
+        outputBudget: metadata.outputBudget,
+        compressionProfile: metadata.compressionProfile,
+        contextUnits: metadata.contextUnits,
+        sourceChunks: metadata.sourceChunks,
+        reductionDepth: metadata.reductionDepth,
+        retryReason: classifyContextError(error) === null
+          ? undefined
+          : "provider_context_error",
+      });
+      if (event.retryReason === undefined) runtime.onEvent?.(event);
+      else forwardContextRepackProgress(runtime, event);
+    }
+  }
+  return {
+    ...runtime.llm,
+    emitsPromptBudget: true,
+    beginPromptBudgetRequest: (requestId) => {
+      pendingRequestId = requestId;
+    },
+    chat: {
+      completions: {
+        create: createWithTelemetry,
+      },
+    },
+  };
+}
+
+function forwardContextRepackProgress(
+  runtime: EvidenceRuntime,
+  event: Extract<RunEvent, { kind: "prompt_budget" }>,
+): void {
+  if (event.retryReason === undefined) return;
+  runtime.onEvent?.(event);
+  runtime.onEvent?.({
+    kind: "tool_use",
+    name: "Evidence context repack",
+    input: {
+      callSite: event.callSite,
+      retryReason: event.retryReason,
+      effectiveInputBudget: event.effectiveInputBudget,
+      contextUnits: event.contextUnits,
+      sourceChunks: event.sourceChunks,
+      reductionDepth: event.reductionDepth,
+    },
+  });
+  runtime.onEvent?.({ kind: "tool_result", ok: true, preview: "retry scheduled" });
+}
+
+async function mapChunk(
+  preparedSourceLines: readonly string[],
+  domainId: string,
+  chunk: SourceChunk,
+  totalChunks: number,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+  mode: EvidenceMappingMode,
+): Promise<VerifiedEvidencePacket[]> {
+  const configuredBudget = policy.inputBudgetTokens;
+  const mapCallSite = runtime.mapCallSite ?? "ingest.evidence-map";
+  const opts = { ...(runtime.opts ?? {}), inputBudgetTokens: configuredBudget };
+  try {
+    const messages = messagesForMapper(mapPrompt, chunk, domainId, mode, preparedSourceLines);
+    const mapperOpts = taskLlmOptions(opts, policy, configuredBudget);
+    const estimatedInputTokens = estimateStructuredRequest(messages, mapperOpts, policy.mapperRetries ?? 1);
+    if (estimatedInputTokens > configuredBudget) {
+      throw new PromptBudgetExceededError(configuredBudget, estimatedInputTokens, []);
+    }
+    const result = await runBoundedStructuredWithRetry<{
+      packets: EvidencePacket[];
+      noEvidence: NoEvidence[];
+    }>({
+      llm: llmWithRequestTelemetry(runtime, {
+        callSite: mapCallSite,
+        configuredInputBudget: configuredBudget,
+        effectiveInputBudget: configuredBudget,
+        outputBudget: policy.outputBudgetTokens,
+        compressionProfile: compressionOf(policy),
+        contextUnits: 1,
+        sourceChunks: totalChunks,
+        reductionDepth: 0,
+      }),
+      model: runtime.model,
+      baseMessages: messages,
+      opts: mapperOpts,
+      profile: sentinelJsonProfile(mapperSchemaFor(chunk, mode)),
+      maxRetries: policy.mapperRetries ?? 1,
+      callSite: mapCallSite,
+      lifecycle: createLlmLifecycle("extract_source_facts"),
+      signal: runtime.signal ?? new AbortController().signal,
+      onEvent: (event) => forwardEvidenceStructuredEvent(runtime, event),
+      transport: "non-stream",
+      contextErrorsRetry: true,
+    });
+    let mapped: VerifiedEvidencePacket[];
+    try {
+      mapped = validateEvidenceMap(
+        { chunk, packets: result.value.packets, noEvidence: result.value.noEvidence },
+        preparedSourceLines,
+      ).map((packet) => ({ ...packet, id: `${chunk.id}:${packet.id}` }));
+    } catch (error) {
+      runtime.onEvent?.(lifecycleEvent(result.lifecycle.id, result.lifecycle.action, "failed"));
+      throw error;
+    }
+    runtime.onEvent?.(lifecycleEvent(result.lifecycle.id, result.lifecycle.action, "applying"));
+    runtime.onEvent?.(lifecycleEvent(result.lifecycle.id, result.lifecycle.action, "completed"));
+    return mapped;
+  } catch (error) {
+    if (error instanceof EvidenceCoverageError) throw error;
+    if (classifyContextError(error) !== null) throw error;
+    throw new EvidenceCoverageError(
+      `Evidence mapper failed for chunk ${chunk.id}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+function lineCountOf(chunk: Pick<SourceChunk, "startLine" | "endLine">): number {
+  return chunk.endLine - chunk.startLine + 1;
+}
+
+function isStructuredMapperFailure(
+  error: unknown,
+): error is EvidenceCoverageError & { cause: StructuredValidationError } {
+  return error instanceof EvidenceCoverageError
+    && error.cause instanceof StructuredValidationError;
+}
+
+type MapperSplitReason = "output_limit" | "chunk_local_validation";
+
+function mapperSplitReason(error: unknown): MapperSplitReason | null {
+  if (!isStructuredMapperFailure(error)) return null;
+  const structured = error.cause;
+  if (structured.errorType === "output_limit") return "output_limit";
+  if (structured.errorType !== "schema_validate" || !(structured.lastError instanceof z.ZodError)) return null;
+  if (structured.lastError.issues.length === 0) return null;
+  const localCodes = new Set(["chunk_coverage_mismatch", "source_range_out_of_bounds"]);
+  return structured.lastError.issues.every((issue) =>
+    localCodes.has(evidenceValidationReason(issue).split(":", 1)[0]))
+    ? "chunk_local_validation"
+    : null;
+}
+
+function normalizeSourceChunksFrom(
+  chunks: SourceChunk[],
+  startIndex: number,
+  createChunk: SourceChunkRangeFactory,
+): void {
+  for (let index = startIndex; index < chunks.length; index++) {
+    const chunk = chunks[index];
+    chunks[index] = createChunk(chunk.startLine, chunk.endLine, index, chunk.headingPath);
+  }
+}
+
+function normalizeMapperChunkWorkFrom(
+  workItems: MapperChunkWork[],
+  startIndex: number,
+  createChunk: SourceChunkRangeFactory,
+): void {
+  for (let index = startIndex; index < workItems.length; index++) {
+    const work = workItems[index];
+    workItems[index] = {
+      ...work,
+      chunk: createChunk(work.chunk.startLine, work.chunk.endLine, index, work.chunk.headingPath),
+    };
+  }
+}
+
+function packAdjacentMapperChunks(
+  chunks: SourceChunk[],
+  createChunk: SourceChunkRangeFactory,
+  canFit: (chunk: SourceChunk) => boolean,
+): SourceChunk[] {
+  const packed: SourceChunk[] = [];
+  for (const next of chunks) {
+    const previous = packed.at(-1);
+    if (previous !== undefined && previous.endLine + 1 === next.startLine) {
+      const merged = createChunk(
+        previous.startLine,
+        next.endLine,
+        packed.length - 1,
+        previous.headingPath,
+      );
+      if (canFit(merged)) {
+        packed[packed.length - 1] = merged;
+        continue;
+      }
+    }
+    packed.push(next);
+  }
+  normalizeSourceChunksFrom(packed, 0, createChunk);
+  return packed;
+}
+
+function splitSourceChunkForEvidenceMap(
+  chunk: SourceChunk,
+  firstOrdinal: number,
+  createChunk: SourceChunkRangeFactory,
+): [SourceChunk, SourceChunk] {
+  if (lineCountOf(chunk) <= 1) {
+    throw new EvidenceCoverageError(`Mapper chunk ${chunk.id} cannot be split into a smaller source range`);
+  }
+  const splitLine = chunk.startLine + Math.floor(lineCountOf(chunk) / 2) - 1;
+  return [
+    createChunk(chunk.startLine, splitLine, firstOrdinal, chunk.headingPath),
+    createChunk(splitLine + 1, chunk.endLine, firstOrdinal + 1, chunk.headingPath),
+  ];
+}
+
+function rechunkMapperSourceForRetry(
+  source: string,
+  preparedSourceLines: readonly string[],
+  createChunk: SourceChunkRangeFactory,
+  domainId: string,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+  mode: EvidenceMappingMode,
+  maximumRawBudget: number,
+  effectiveInputBudget: number,
+): SourceChunk[] {
+  const planned = findLargestFeasibleBudget<SourceChunk[]>(1, Math.min(maximumRawBudget, effectiveInputBudget), (rawBudget) => {
+    let chunks: SourceChunk[];
+    try {
+      chunks = chunkMarkdownSource(source, {
+        maxEstimatedTokens: rawBudget,
+        overlapLines: policy.overlapLines ?? 0,
+      });
+    } catch {
+      return { kind: "too-small" as const };
+    }
+    const mapperOpts = taskLlmOptions(runtime.opts ?? {}, policy, effectiveInputBudget);
+    chunks = packAdjacentMapperChunks(chunks, createChunk, (chunk) => {
+      const details = mapperRequestDetails(
+        preparedSourceLines,
+        chunk,
+        domainId,
+        mode,
+        policy,
+        runtime.opts ?? {},
+      );
+      return details.rawTokens <= maximumRawBudget
+        && mapperEstimateFits(details.estimatedInputTokens, effectiveInputBudget);
+    });
+    const largest = Math.max(...chunks.map((chunk) => estimateStructuredRequest(
+      messagesForMapper(mapPrompt, chunk, domainId, mode, preparedSourceLines), mapperOpts, policy.mapperRetries ?? 1,
+    )));
+    return mapperEstimateFits(largest, effectiveInputBudget)
+      ? { kind: "feasible" as const, value: chunks }
+      : { kind: "too-large" as const };
+  });
+  if (planned === undefined) {
+    throw new EvidenceCoverageError("Mapper context retry cannot derive a smaller fitting source chunk");
+  }
+  return planned.value;
+}
+
+async function mapChunksWithContextRepack(
+  source: string,
+  domainId: string,
+  initialChunks: SourceChunk[],
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+  mode: EvidenceMappingMode,
+): Promise<{ chunks: SourceChunk[]; packets: VerifiedEvidencePacket[]; noEvidence: NoEvidence[] }> {
+  const configuredBudget = policy.inputBudgetTokens;
+  const mapCallSite = runtime.mapCallSite ?? "ingest.evidence-map";
+  const preparedSourceLines = sourceLines(source);
+  const createChunk = createSourceChunkRangeFactory(source);
+  let failedMapper: (MapperRequestDetails
+    & Pick<SourceChunk, "id" | "startLine" | "endLine">
+    & Pick<MapperChunkWork, "splitDepth">) | undefined;
+  const semanticSplitLineage: Array<Pick<SourceChunk, "startLine" | "endLine">> = [];
+  return runWithContextRepack({
+    onContextError: runtime.opts?.onContextError,
+    requestBudgetsEmittedByExecute: true,
+    callSite: mapCallSite,
+    configuredInputBudget: configuredBudget,
+    outputBudget: policy.outputBudgetTokens,
+    compressionProfile: compressionOf(policy),
+    build: (effectiveInputBudget) => {
+      const effectivePolicy = { ...policy, inputBudgetTokens: effectiveInputBudget };
+      let chunks: SourceChunk[];
+      if (failedMapper === undefined && effectiveInputBudget === configuredBudget) {
+        chunks = initialChunks;
+      } else if (failedMapper === undefined) {
+        chunks = planSourceChunksForEvidence(
+          source,
+          preparedSourceLines,
+          createChunk,
+          domainId,
+          effectivePolicy,
+          runtime.opts ?? {},
+          mode,
+        );
+      } else {
+        const forcedRawBudget = failedMapper.rawTokens - 1;
+        if (forcedRawBudget <= 0) {
+          throw new EvidenceCoverageError(`Mapper chunk ${failedMapper.id} cannot be split into a smaller original-source range`);
+        }
+        chunks = rechunkMapperSourceForRetry(
+          source,
+          preparedSourceLines,
+          createChunk,
+          domainId,
+          effectivePolicy,
+          runtime,
+          mode,
+          forcedRawBudget,
+          effectiveInputBudget,
+        );
+      }
+      assertCompleteSourceCoverage(source, chunks);
+      const mapperOpts = taskLlmOptions(runtime.opts ?? {}, policy, effectiveInputBudget);
+      const estimates = chunks.map((chunk) => estimateStructuredRequest(
+        messagesForMapper(mapPrompt, chunk, domainId, mode, preparedSourceLines),
+        mapperOpts,
+        policy.mapperRetries ?? 1,
+      ));
+      const estimatedInputTokens = Math.max(...estimates);
+      if (estimatedInputTokens > effectiveInputBudget) {
+        throw new PromptBudgetExceededError(effectiveInputBudget, estimatedInputTokens, []);
+      }
+      if (failedMapper !== undefined) {
+        const replacements = chunks.filter((chunk) => chunk.endLine >= failedMapper!.startLine
+          && chunk.startLine <= failedMapper!.endLine);
+        if (replacements.length === 0) {
+          throw new EvidenceCoverageError(`Mapper failed chunk ${failedMapper.id} has no replacement range`);
+        }
+        const replacementDetails = replacements.map((chunk) => mapperRequestDetails(
+          preparedSourceLines, chunk, domainId, mode, effectivePolicy, runtime.opts ?? {},
+        ));
+        if (replacementDetails.some((details) => details.hash === failedMapper!.hash)
+          || Math.max(...replacementDetails.map((details) => details.estimatedInputTokens))
+            >= failedMapper.estimatedInputTokens) {
+          throw new EvidenceCoverageError(`Mapper retry for chunk ${failedMapper.id} did not make strict progress`);
+        }
+      }
+      const workItems: MapperChunkWork[] = chunks.map((chunk) => ({
+        chunk,
+        splitDepth: (failedMapper?.splitDepth === 1
+          && chunk.endLine >= failedMapper.startLine
+          && chunk.startLine <= failedMapper.endLine)
+          || semanticSplitLineage.some((lineage) =>
+            chunk.endLine >= lineage.startLine && chunk.startLine <= lineage.endLine) ? 1 : 0,
+      }));
+      return {
+        value: { workItems, effectiveInputBudget },
+        estimatedInputTokens,
+        contextUnits: chunks.length,
+        sourceChunks: chunks.length,
+        reductionDepth: 0,
+      };
+    },
+    execute: async ({ workItems, effectiveInputBudget }) => {
+      const effectivePolicy = { ...policy, inputBudgetTokens: effectiveInputBudget };
+      const activeWorkItems = [...workItems];
+      const packets: VerifiedEvidencePacket[] = [];
+      const noEvidence: NoEvidence[] = [];
+      for (let index = 0; index < activeWorkItems.length; index++) {
+        const work = activeWorkItems[index];
+        const chunk = work.chunk;
+        const details = mapperRequestDetails(
+          preparedSourceLines, chunk, domainId, mode, effectivePolicy, runtime.opts ?? {},
+        );
+        let mapped: VerifiedEvidencePacket[];
+        try {
+          mapped = await mapChunk(
+            preparedSourceLines, domainId, chunk, activeWorkItems.length, effectivePolicy, runtime, mode,
+          );
+        } catch (error) {
+          if (classifyContextError(error) !== null) {
+            failedMapper = {
+              ...details,
+              id: chunk.id,
+              startLine: chunk.startLine,
+              endLine: chunk.endLine,
+              splitDepth: work.splitDepth,
+            };
+          }
+          const splitReason = mapperSplitReason(error);
+          if (splitReason !== null && work.splitDepth === 0 && lineCountOf(chunk) > 1) {
+            const prospectiveWorkItems = [...activeWorkItems];
+            prospectiveWorkItems.splice(
+              index,
+              1,
+              ...splitSourceChunkForEvidenceMap(chunk, index, createChunk)
+                .map((replacement): MapperChunkWork => ({ chunk: replacement, splitDepth: 1 })),
+            );
+            normalizeMapperChunkWorkFrom(prospectiveWorkItems, index, createChunk);
+            const replacements = prospectiveWorkItems.slice(index, index + 2);
+            const replacementDetails = replacements.map((replacement) => mapperRequestDetails(
+              preparedSourceLines,
+              replacement.chunk,
+              domainId,
+              mode,
+              effectivePolicy,
+              runtime.opts ?? {},
+            ));
+            if (replacementDetails.length !== 2
+              || replacementDetails.some((replacement) =>
+                replacement.estimatedInputTokens >= details.estimatedInputTokens)) {
+              throw error;
+            }
+            activeWorkItems.splice(0, activeWorkItems.length, ...prospectiveWorkItems);
+            semanticSplitLineage.push(...replacements.map(({ chunk: replacement }) => ({
+              startLine: replacement.startLine,
+              endLine: replacement.endLine,
+            })));
+            index -= 1;
+            runtime.onEvent?.({
+              kind: "tool_use",
+              name: "Evidence mapper split",
+              input: {
+                chunkId: chunk.id,
+                startLine: chunk.startLine,
+                endLine: chunk.endLine,
+                replacementChunks: replacements.length,
+                reason: splitReason,
+                splitDepth: work.splitDepth,
+              },
+            });
+            runtime.onEvent?.({ kind: "tool_result", ok: true, preview: "retry scheduled" });
+            continue;
+          }
+          throw error;
+        }
+        if (mapped.length === 0) noEvidence.push({ chunkId: chunk.id, reason: "No domain evidence" });
+        packets.push(...mapped);
+      }
+      return { chunks: activeWorkItems.map(({ chunk }) => chunk), packets, noEvidence };
+    },
+    onEvent: (event) => forwardContextRepackProgress(runtime, event),
+  });
+}
+
+function reducerFits(units: EvidenceUnit[], budget: number, opts: LlmCallOptions, retries: number): boolean {
+  return estimateStructuredRequest(messagesForReducer(units), opts, retries) <= budget;
+}
+
+export function partitionUnits(
+  units: EvidenceUnit[],
+  budget: number,
+  opts: LlmCallOptions,
+  retries: number,
+  onEstimate?: () => void,
+  maxBatchUnits?: number,
+): EvidenceUnit[][] {
+  if (maxBatchUnits !== undefined && (!Number.isSafeInteger(maxBatchUnits) || maxBatchUnits <= 0)) {
+    throw new EvidenceReducerError("Reducer retry batch limit must be positive");
+  }
+  const batches: EvidenceUnit[][] = [];
+  let start = 0;
+  while (start < units.length) {
+    onEstimate?.();
+    if (!reducerFits([units[start]], budget, opts, retries)) {
+      throw new EvidenceReducerError(`A single evidence packet cannot fit the reducer budget (${packetIdsOf(units[start]).join(", ")})`);
+    }
+    let low = start + 1;
+    let high = Math.min(units.length, start + (maxBatchUnits ?? units.length));
+    let end = start + 1;
+    while (low <= high) {
+      const middle = low + Math.floor((high - low) / 2);
+      onEstimate?.();
+      if (reducerFits(units.slice(start, middle), budget, opts, retries)) {
+        end = middle;
+        low = middle + 1;
+      } else high = middle - 1;
+    }
+    batches.push(units.slice(start, end));
+    start = end;
+  }
+  return batches;
+}
+
+async function reduceBatchOnce(
+  units: EvidenceUnit[],
+  totalChunks: number,
+  depth: number,
+  reducerBudget: number,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+): Promise<EntityEvidence> {
+  const expected = evidenceFromUnits(units);
+  const configuredBudget = policy.inputBudgetTokens;
+  try {
+    const messages = messagesForReducer(units);
+    const reducerOpts = taskLlmOptions(runtime.opts ?? {}, policy, reducerBudget);
+    const estimatedInputTokens = estimateStructuredRequest(messages, reducerOpts, policy.reducerRetries ?? 1);
+    if (estimatedInputTokens > reducerBudget) {
+      throw new PromptBudgetExceededError(reducerBudget, estimatedInputTokens, []);
+    }
+    const response = await runBoundedStructuredWithRetry<EntityEvidence>({
+      llm: llmWithRequestTelemetry(runtime, {
+        callSite: "ingest.evidence-reduce",
+        configuredInputBudget: configuredBudget,
+        effectiveInputBudget: reducerBudget,
+        outputBudget: policy.outputBudgetTokens,
+        compressionProfile: compressionOf(policy),
+        contextUnits: units.length,
+        sourceChunks: totalChunks,
+        reductionDepth: depth,
+      }),
+      model: runtime.model,
+      baseMessages: messages,
+      opts: reducerOpts,
+      profile: sentinelJsonProfile(reducerSchemaFor(expected)),
+      maxRetries: policy.reducerRetries ?? 1,
+      callSite: "ingest.evidence-reduce",
+      lifecycle: createLlmLifecycle("reduce_source_evidence"),
+      signal: runtime.signal ?? new AbortController().signal,
+      onEvent: (event) => forwardEvidenceStructuredEvent(runtime, event),
+      transport: "non-stream",
+      contextErrorsRetry: true,
+    });
+    try {
+      assertReducedEntity(expected, response.value);
+      if (JSON.stringify(response.value).length >= JSON.stringify(units).length) {
+        throw new EvidenceReducerError(`Reducer non-progress at depth ${depth}`);
+      }
+    } catch (error) {
+      runtime.onEvent?.(lifecycleEvent(response.lifecycle.id, response.lifecycle.action, "failed"));
+      throw error;
+    }
+    runtime.onEvent?.(lifecycleEvent(response.lifecycle.id, response.lifecycle.action, "applying"));
+    runtime.onEvent?.(lifecycleEvent(response.lifecycle.id, response.lifecycle.action, "completed"));
+    return response.value;
+  } catch (error) {
+    if (error instanceof EvidenceReducerError) throw error;
+    if (classifyContextError(error) !== null) throw error;
+    throw new EvidenceReducerError(
+      `Evidence reducer failed at depth ${depth}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+async function reduceBatch(
+  units: EvidenceUnit[],
+  totalChunks: number,
+  depth: number,
+  reducerBudget: number,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+): Promise<EntityEvidence[]> {
+  const configuredBudget = policy.inputBudgetTokens;
+  const retries = policy.reducerRetries ?? 1;
+  let failedReducer: { hash: string; units: EvidenceUnit[]; estimatedInputTokens: number } | undefined;
+  return runWithContextRepack({
+    onContextError: runtime.opts?.onContextError,
+    requestBudgetsEmittedByExecute: true,
+    callSite: "ingest.evidence-reduce",
+    configuredInputBudget: configuredBudget,
+    outputBudget: policy.outputBudgetTokens,
+    compressionProfile: compressionOf(policy),
+    build: (effectiveInputBudget) => {
+      const budget = Math.min(reducerBudget, effectiveInputBudget);
+      const reducerOpts = taskLlmOptions(runtime.opts ?? {}, policy, budget);
+      const maxBatchUnits = failedReducer === undefined ? undefined : failedReducer.units.length - 1;
+      if (maxBatchUnits !== undefined && maxBatchUnits <= 0) {
+        throw new EvidenceReducerError("Reducer context retry cannot split a single-unit batch");
+      }
+      const batches = partitionUnits(units, budget, reducerOpts, retries, undefined, maxBatchUnits);
+      batches.forEach((batch) => assertReducerOutputFits(batch, depth, policy.outputBudgetTokens));
+      const estimates = batches.map((batch) => estimateStructuredRequest(
+        messagesForReducer(batch), reducerOpts, retries,
+      ));
+      if (failedReducer !== undefined) {
+        const failedIds = new Set(packetIdsOf(failedReducer.units[0]));
+        const replacements = batches.filter((batch) => batch.some((item) => packetIdsOf(item).some((id) => failedIds.has(id))));
+        if (replacements.length === 0 || replacements.some((batch) => {
+          const estimate = estimateStructuredRequest(messagesForReducer(batch), reducerOpts, retries);
+          return estimate >= failedReducer!.estimatedInputTokens
+            || JSON.stringify(messagesForReducer(batch)) === failedReducer!.hash;
+        })) {
+          throw new EvidenceReducerError("Reducer retry did not make strict progress");
+        }
+      }
+      return {
+        value: { batches, budget },
+        estimatedInputTokens: Math.max(...estimates),
+        contextUnits: batches.reduce((sum, batch) => sum + batch.length, 0),
+        sourceChunks: totalChunks,
+        reductionDepth: depth,
+      };
+    },
+    execute: async ({ batches, budget }) => {
+      const reduced: EntityEvidence[] = [];
+      for (const batch of batches) {
+        const messages = messagesForReducer(batch);
+        const details = {
+          hash: JSON.stringify(messages),
+          units: [...batch],
+          estimatedInputTokens: estimateStructuredRequest(
+            messages,
+            taskLlmOptions(runtime.opts ?? {}, policy, budget),
+            retries,
+          ),
+        };
+        try {
+          reduced.push(await reduceBatchOnce(batch, totalChunks, depth, budget, policy, runtime));
+        } catch (error) {
+          if (classifyContextError(error) !== null) failedReducer = details;
+          throw error;
+        }
+      }
+      return reduced;
+    },
+    onEvent: (event) => forwardContextRepackProgress(runtime, event),
+  });
+}
+
+async function reduceUntilBounded(
+  units: EvidenceUnit[],
+  totalChunks: number,
+  depth: number,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+): Promise<EntityEvidence> {
+  const aggregate = evidenceFromUnits(units);
+  const reducerOpts = taskLlmOptions(runtime.opts ?? {}, policy, policy.inputBudgetTokens);
+  const reducerRetries = policy.reducerRetries ?? 1;
+  const combinedFits = reducerFits(units, policy.inputBudgetTokens, reducerOpts, reducerRetries);
+  if (depth === 0 && combinedFits) return aggregate;
+  if (depth > 0 && units.length === 1 && combinedFits && isEntityEvidence(units[0])) {
+    return units[0];
+  }
+  if (depth >= (policy.maxReductionDepth ?? 8)) {
+    throw new EvidenceReducerError(`Maximum evidence reduction depth ${depth} reached`);
+  }
+  const reducerBudget = policy.inputBudgetTokens;
+  if (reducerBudget <= 0) {
+    throw new EvidenceReducerError("Reducer prompt and repair reserve exceed the input budget");
+  }
+  const batches = partitionUnits(units, reducerBudget, reducerOpts, reducerRetries);
+  if (batches.length >= units.length) {
+    throw new EvidenceReducerError(`Reducer made no progress at depth ${depth}`);
+  }
+  for (const batch of batches) {
+    assertReducerOutputFits(batch, depth + 1, policy.outputBudgetTokens);
+  }
+  const reduced: EntityEvidence[] = [];
+  for (const batch of batches) {
+    reduced.push(...await reduceBatch(
+      batch, totalChunks, depth + 1, reducerBudget, policy, runtime,
+    ));
+  }
+  if (reduced.length >= units.length) {
+    throw new EvidenceReducerError(`Reducer did not shrink packet groups at depth ${depth}`);
+  }
+  return reduceUntilBounded(reduced, totalChunks, depth + 1, policy, runtime);
+}
+
+async function prepareSourceEvidenceInternal(
+  source: string,
+  domainId: string,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+  mode: EvidenceMappingMode,
+): Promise<EntityEvidence[]> {
+  ensurePolicy(policy, runtime.opts);
+  ensureOutputBudget(policy, runtime.opts);
+  const configuredTypes = mode.rejectEntityTypes
+    ? []
+    : mode.allowedEntityTypes === undefined
+      ? undefined
+      : [...mode.allowedEntityTypes];
+  const chunks = chunkSourceForEvidence(
+    source,
+    domainId,
+    policy,
+    runtime.opts ?? {},
+    configuredTypes,
+  );
+  assertCompleteSourceCoverage(source, chunks);
+  if (chunks.length === 0) return [];
+  const mappedSource = await mapChunksWithContextRepack(source, domainId, chunks, policy, runtime, mode);
+  const finalChunks = mappedSource.chunks;
+  const packets: VerifiedEvidencePacket[] = [];
+  const noEvidence = mappedSource.noEvidence;
+  const allMapped = mappedSource.packets;
+  const configuredType = mode.allowedEntityTypes?.size === 1
+    ? [...mode.allowedEntityTypes][0]
+    : undefined;
+  const observedTypes = new Map<string, Set<string>>();
+  for (const packet of allMapped) {
+    if (packet.entityType !== undefined) {
+      const types = observedTypes.get(packet.entityKey) ?? new Set<string>();
+      types.add(packet.entityType);
+      observedTypes.set(packet.entityKey, types);
+    }
+  }
+  for (const packet of allMapped) {
+    const types = observedTypes.get(packet.entityKey) ?? new Set<string>();
+    if (types.size > 1) {
+      throw new EvidenceCoverageError(`Conflicting entity type for ${packet.entityKey}: ${[...types].join(", ")}`);
+    }
+    if (packet.entityType === undefined) {
+      const inherited = [...types][0] ?? configuredType;
+      if (inherited !== undefined) packet.entityType = inherited;
+    }
+    packets.push(packet);
+  }
+  const groups = new Map<string, VerifiedEvidencePacket[]>();
+  for (const packet of packets) {
+    const group = groups.get(packet.entityKey) ?? [];
+    group.push(packet);
+    groups.set(packet.entityKey, group);
+  }
+  assertCompleteSourceCoverage(source, finalChunks);
+  buildEvidenceCoverage(finalChunks.map((chunk) => chunk.id), packets, noEvidence);
+  const result: EntityEvidence[] = [];
+  for (const group of groups.values()) {
+    result.push(await reduceUntilBounded(group, finalChunks.length, 0, policy, runtime));
+  }
+  return result;
+}
+
+export async function prepareSourceEvidence(
+  source: string,
+  domainId: string,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+): Promise<EntityEvidence[]> {
+  const configuredEntityTypes = runtime.configuredEntityTypes ?? [];
+  return prepareSourceEvidenceInternal(sourceForEvidence(source), domainId, policy, runtime, {
+    rejectEntityTypes: configuredEntityTypes.length === 0,
+    allowedEntityTypes: new Set(configuredEntityTypes),
+  });
+}
+
+export async function prepareBootstrapEvidenceBundle(
+  source: string,
+  provisionalDomainId: string,
+  sourcePath: string,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+): Promise<BootstrapEvidenceBundle> {
+  const evidence = await prepareSourceEvidenceInternal(sourceForEvidence(source), provisionalDomainId, policy, runtime, {
+    rejectEntityTypes: true,
+    allowedEntityTypes: new Set(),
+  });
+  const candidates = evidence.map(({ entityKey, packetIds, facts, exactSource }) => ({
+    entityKey,
+    packetIds: [...packetIds],
+    facts: [...facts],
+    exactSource: exactSource.map((range) => ({ ...range })),
+  }));
+  const domainThemes = sampleEvenly(
+    unique(evidence.flatMap((item) => item.facts), (fact) => fact),
+    MAX_DOMAIN_THEMES,
+  ).map(boundOverheadItem);
+  const languageEvidence = sampleEvenly(
+    unique(
+      evidence.flatMap((item) => item.exactSource.map((range) => range.text)),
+      (text) => text,
+    ),
+    MAX_LANGUAGE_EVIDENCE,
+  ).map(boundOverheadItem);
+  const payloadBudget = Math.min(
+    policy.inputBudgetTokens,
+    policy.bootstrapPayloadBudgetTokens ?? policy.inputBudgetTokens,
+  );
+  if (!Number.isSafeInteger(payloadBudget) || payloadBudget <= 0) {
+    throw new EvidenceCoverageError("Bootstrap payload budget must be a positive safe integer");
+  }
+  // No size check throws here. A group larger than the budget means the evidence
+  // is atomic, and the operation must not end on size — so the number is reported
+  // upward and the caller widens the budget instead.
+  const split = splitBootstrapPayload(
+    { candidates, domainThemes, languageEvidence },
+    payloadBudget,
+    runtime.opts?.tokenCalibration,
+  );
+  return {
+    bootstrap: split.groups[0],
+    bootstrapGroups: split.groups,
+    bootstrapMinimumGroupTokens: split.minimumGroupTokens,
+    bootstrapSubdivided: split.subdivided,
+    evidence,
+    domainId: provisionalDomainId,
+    sourcePath,
+    sourceBodyHash: hashSource(source),
+  };
+}
+
+export async function prepareBootstrapEvidence(
+  source: string,
+  provisionalDomainId: string,
+  policy: EvidencePolicy,
+  runtime: EvidenceRuntime,
+): Promise<BootstrapEvidence> {
+  return (await prepareBootstrapEvidenceBundle(
+    source,
+    provisionalDomainId,
+    "",
+    policy,
+    runtime,
+  )).bootstrap;
+}

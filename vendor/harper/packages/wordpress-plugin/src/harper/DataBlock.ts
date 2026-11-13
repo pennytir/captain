@@ -1,0 +1,75 @@
+import { dispatch } from '@wordpress/data';
+import { getNodesFromQuerySelector, getRichTextContainers } from './domUtils';
+import RichText from './RichText';
+
+/**
+ * Represents a Gutenberg block on-screen.
+ * So named because all of these blocks have a `data-block` attribute.
+ */
+export default class DataBlock {
+	public readonly targetElement: Element;
+
+	constructor(targetElement: Element) {
+		this.targetElement = targetElement;
+	}
+
+	private getClientId(): string {
+		return this.targetElement.getAttribute('data-block')!;
+	}
+
+	public getAllRichText(): RichText[] {
+		const containers = getRichTextContainers(this.targetElement);
+
+		return containers.map(
+			(cont) =>
+				new RichText(cont, this, async (newContent: string) => {
+					// Named Gutenberg stores do not expose their action types.
+					const { updateBlockAttributes } = dispatch('core/block-editor') as {
+						updateBlockAttributes(clientId: string, attributes: Record<string, string>): unknown;
+					};
+
+					const attributeName = cont.getAttribute('data-wp-block-attribute-key') ?? 'content';
+
+					await updateBlockAttributes(this.getClientId(), {
+						[attributeName]: newContent,
+					});
+				}),
+		);
+	}
+
+	public static getAllDataBlocks(): DataBlock[] {
+		const container = this.getContainer();
+		if (container === null) return [];
+
+		const targetNodes = [...getNodesFromQuerySelector(container, '[data-block]')];
+
+		return targetNodes.map((node) => new DataBlock(node));
+	}
+
+	/** Get all DataBlocks in the document, then remove any that have other DataBlocks as children. */
+	public static getTerminalDataBlocks(): DataBlock[] {
+		const blocks = this.getAllDataBlocks();
+
+		return blocks.filter((block) => {
+			for (const otherBlock of blocks) {
+				if (otherBlock === block) {
+					continue;
+				}
+
+				if (block.targetElement.contains(otherBlock.targetElement)) {
+					return false;
+				}
+			}
+
+			return true;
+		});
+	}
+
+	/** Find the current editor container, or return null while it loads or changes layouts. */
+	public static getContainer(): Element | null {
+		const iframe = document.querySelector<HTMLIFrameElement>('iframe[name="editor-canvas"]');
+		return (
+			iframe?.contentDocument?.body || document.querySelector('.edit-post-visual-editor > div')
+		);
+	}
+}

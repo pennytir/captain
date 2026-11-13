@@ -1,0 +1,1001 @@
+import type OpenAI from "openai";
+import type { DomainEntry, EntityType } from "./domain";
+import type { EvalMetaFields } from "./eval-log";
+import type { FileMutation } from "./file-transaction";
+import type { PromptCensus } from "./token-estimate";
+import type { IngestLogEntry } from "./wiki-log";
+
+export type WikiOperation =
+  | "ingest"
+  | "query"
+  | "lint"
+  | "lint-chat"
+  | "chat"
+  | "init"
+  | "format"
+  | "delete";
+
+export type StructuredCallSite =
+  | "init.bootstrap"
+  | "init.bootstrap-map"
+  | "init.bootstrap-type-map"
+  | "init.delta"
+  | "lint.patch"
+  | "lint.fix"
+  | "lint.batch"
+  | "lint-chat.fix"
+  | "lint-chat.patch"
+  | "query.seeds"
+  | "query.answer"
+  | "ingest.entities"
+  | "ingest.evidence-map"
+  | "ingest.evidence-reduce"
+  | "ingest.pages"
+  | "ingest.synthesize"
+  | "ingest.merge"
+  | "ingest.classify"
+  | "format.output"
+  | "format.segment"
+  | "vision.analysis";
+
+export type LlmLifecyclePhase =
+  | "preparing"
+  | "sent"
+  | "waiting"
+  | "producing"
+  | "validating"
+  | "applying"
+  | "completed"
+  | "retrying"
+  | "failed"
+  | "cancelled";
+
+export type LlmLifecycleAction =
+  | "bootstrap_domain"
+  | "extract_source_facts"
+  | "reduce_source_evidence"
+  | "synthesize_wiki_pages"
+  | "select_relevant_pages"
+  | "answer_question"
+  | "check_wiki_quality"
+  | "apply_lint_fixes"
+  | "format_note"
+  | "analyze_attachments"
+  | "retry_model_request";
+
+export interface LlmLifecycleDiagnostics {
+  callSite?: StructuredCallSite;
+  transport?: "stream" | "non-stream";
+  attempt?: number;
+  configuredInputBudget?: number;
+  effectiveInputBudget?: number;
+  provider?: string;
+}
+
+export type OnFileError = (
+  file: string,
+  err: Error,
+  canRetry: boolean,
+) => Promise<"skip" | "retry" | "stop">;
+
+export interface IngestDeferredEffects {
+  domainPatch?: { entity_types: EntityType[] };
+  sourcePathAdded?: { domainId: string; path: string };
+  log?: {
+    sourcePath: string;
+    entries: IngestLogEntry[];
+    outputTokens: number;
+  };
+  manifestComplete: boolean;
+  mutations: FileMutation[];
+}
+
+/** Internal delete-rebuild mode; never derived from user-configurable settings. */
+export interface IngestInternalExecution {
+  deferCommitEffects: true;
+  transaction: {
+    readonly manifestComplete: boolean;
+    readonly mutations: FileMutation[];
+  };
+}
+
+export interface DeleteEntityTypeDelta {
+  type: string;
+  before?: EntityType;
+  after?: EntityType;
+}
+
+export interface DeleteStateCommitEvent {
+  kind: "delete_state_commit";
+  domainId: string;
+  journalPath: string;
+  journalHash: string;
+  /** Exact SHA-256 of the controller-persisted published journal receipt. */
+  receiptHash?: string;
+  metadataPath: string;
+  sourcePathAdds: string[];
+  sourcePathRemoved: string;
+  analyzedRemoval: { path: string; beforeHash?: string };
+  entityTypeDeltas: DeleteEntityTypeDelta[];
+}
+
+export type IngestOutcome =
+  | {
+      ok: true;
+      sourcePath: string;
+      created: string[];
+      updated: string[];
+      deleted: string[];
+      outputTokens: number;
+      sourceBodyHash: string;
+      deferred?: IngestDeferredEffects;
+    }
+  | {
+      ok: false;
+      sourcePath?: string;
+      stage: "read" | "evidence" | "context" | "synthesis" | "patch" | "write" | "index" | "embedding" | "backlink";
+      message: string;
+      retryable: boolean;
+      deferred?: IngestDeferredEffects;
+    };
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export type WikiDomain = string;
+
+export interface RunRequest {
+  operation: WikiOperation;
+  policyOperation?: OpKey;
+  args: string[];
+  cwd: string | undefined;
+  signal: AbortSignal;
+  timeoutMs: number;
+  domainId?: string;
+  runId?: string;
+  context?: string;
+  instruction?: string;
+  onFileError?: OnFileError;
+  chatMessages?: ChatMessage[];
+  operationHeader?: string;
+  lintOpts?: { useLlm: boolean; entityTypeFilter: string[] };
+}
+
+type TransportRetryMetadata = {
+  logicalRequestId: string;
+  lifecycleId: string;
+  callSite: string;
+  attempt: number;
+  maxRetries: number;
+  maxResponseStartRetries?: number;
+  errorClass?: string;
+  status?: number;
+  delayMs?: number;
+  delaySource?: "retry-after-ms" | "retry-after" | "backoff";
+  meaningfulOutputSeen: boolean;
+  connectionTimeoutMs: number;
+  idleTimeoutMs: number;
+  providerRequestId?: string;
+  clientRequestId?: string;
+  traceparent?: string;
+};
+
+export type NativeNetworkTransport =
+  | "desktop-direct"
+  | "desktop-host"
+  | "desktop-hybrid"
+  | "desktop-proxy"
+  | "mobile-host";
+export type NativeTransportDiagnosticMode = "off" | "connection-close" | "undici-request-adapter";
+export type NativeTransportTraceStage =
+  | "fetch_start"
+  | "fetch_headers"
+  | "body_start"
+  | "body_chunk"
+  | "body_end"
+  | "fetch_error"
+  | "fetch_abort"
+  | "body_error"
+  | "sdk_complete";
+
+export type NativeTransportTraceRecord = {
+  stage: NativeTransportTraceStage;
+  networkTransport: NativeNetworkTransport;
+  endpointPath: string;
+  diagnosticMode: NativeTransportDiagnosticMode;
+  elapsedMs: number;
+  status?: number;
+  contentType?: string;
+  contentLength?: number;
+  bodyBytes?: number;
+  bodyChunks?: number;
+  errorClass?: string;
+  errorCode?: string;
+  causeClass?: string;
+  causeCode?: string;
+  clientRequestId?: string;
+  traceparent?: string;
+};
+
+export type NativeTransportTraceSnapshot = {
+  startedAtMs: number;
+  events: NativeTransportTraceRecord[];
+};
+
+type NativeTransportTraceMetadata = NativeTransportTraceRecord & {
+  logicalRequestId: string;
+  lifecycleId: string;
+  callSite: string;
+  transport: "stream" | "non-stream";
+  attempt: number;
+  connectionTimeoutMs: number;
+  idleTimeoutMs: number;
+};
+
+type NativeHttpResponseMetadata = {
+  logicalRequestId: string;
+  lifecycleId: string;
+  callSite: string;
+  transport: "stream" | "non-stream";
+  attempt: number;
+  status: number;
+  endpointPath: string;
+  networkTransport: NativeNetworkTransport;
+  connectionTimeoutMs: number;
+  idleTimeoutMs: number;
+  providerRequestId?: string;
+  clientRequestId?: string;
+  traceparent?: string;
+};
+
+type NativeTransportCorrelationMetadata = {
+  logicalRequestId: string;
+  lifecycleId: string;
+  callSite: string;
+  transport: "stream" | "non-stream";
+  attempt: number;
+  endpointPath: string;
+  networkTransport: NativeNetworkTransport;
+  diagnosticMode: NativeTransportDiagnosticMode;
+  connectionTimeoutMs: number;
+  idleTimeoutMs: number;
+  clientRequestId: string;
+  traceparent: string;
+};
+
+export type RunEvent =
+  | { kind: "system"; message: string; sessionId?: string }
+  | {
+      kind: "run_config";
+      llmConnectionTimeoutMs: number;
+      llmIdleTimeoutMs: number;
+      nativeTransport?: NativeTransportDiagnostic;
+    }
+  | {
+      kind: "wipe_manifest_chunk";
+      domainId: string;
+      transactionId: string;
+      chunkIndex: number;
+      chunkCount: number;
+      hashAlgorithm: "sha256-v2";
+      entries: Array<{ path: string; hash?: string }>;
+      chunkHash: string;
+    }
+  | {
+      kind: "wipe_complete";
+      domainId: string;
+      transactionId: string;
+      chunkCount: number;
+      totalCount: number;
+      hashAlgorithm: "sha256-v2";
+      manifestHash: string;
+      atMs: number;
+    }
+  | {
+      kind: "llm_lifecycle";
+      id: string;
+      action: LlmLifecycleAction;
+      phase: LlmLifecyclePhase;
+      atMs: number;
+      diagnostics?: LlmLifecycleDiagnostics;
+    }
+  | { kind: "tool_use"; name: string; input: unknown }
+  | { kind: "tool_result"; ok: boolean; preview?: string }
+  | {
+      kind: "index_effect";
+      domainId: string;
+      sourcePath: string;
+      stage: "page_reconcile" | "final_reconcile";
+    }
+  | { kind: "assistant_text"; delta: string; isReasoning?: boolean }
+  | { kind: "assistant_replace"; text: string }
+  | { kind: "info_text"; icon: string; summary: string; details?: string[] }
+  | { kind: "result"; durationMs: number; text: string; outputTokens?: number }
+  | {
+      kind: "llm_call_stats";
+      inputTokens?: number;
+      outputTokens: number;
+      ttftMs: number;
+      llmDurationMs: number;
+      inTokPerSec: number;
+      outTokPerSec: number;
+    }
+  | {
+      kind: "prompt_budget";
+      requestId?: string;
+      callSite: StructuredCallSite;
+      configuredInputBudget: number;
+      effectiveInputBudget: number;
+      estimatedInputTokens: number;
+      actualInputTokens?: number;
+      outputBudget?: number;
+      compressionProfile?: CompressionProfile;
+      contextUnits: number;
+      sourceChunks?: number;
+      reductionDepth?: number;
+      retryReason?: string;
+      contextWindow?: number;
+      inputSource?: BudgetInputSource;
+      outputSource?: "override" | "default";
+      calibration?: number;
+    }
+  | {
+      kind: "budget_resolved";
+      operation: OpKey;
+      model: string;
+      contextWindow: number;
+      inputSource: BudgetInputSource;
+      outputSource: "override" | "default";
+      calibration: number;
+      samples: number;
+      inputBudget: number;
+      outputBudget: number;
+    }
+  | {
+      kind: "context_probe";
+      baseUrl: string;
+      model: string;
+      endpoint: string;
+      ok: boolean;
+      ms: number;
+      /**
+       * Whether the endpoint listed an entry with this model's id — independent of
+       * whether that entry advertised a window. `matchedById: true` with no
+       * `contextLength` is the aggregating-gateway case ("model found, no window
+       * advertised"); `matchedById: false` is "no such model in this listing".
+       *
+       * Absent for two different reasons, both meaning "no verdict": the endpoint is
+       * queried FOR one model and can never match by id (`/api/show`), or the listing
+       * could not be read at all, in which case `ok` is `false`.
+       */
+      matchedById?: boolean;
+      contextLength?: number;
+    }
+  | {
+      /**
+       * The provider rejected a prompt against a window the user configured
+       * explicitly. The configured window stands (see `observeContextError`); this
+       * event is the only record that the provider disagreed with it.
+       */
+      kind: "context_window_conflict";
+      model: string;
+      contextWindow: number;
+      reportedWindow: number;
+      promptTokens?: number;
+    }
+  | {
+      kind: "calibration_sample";
+      model: string;
+      estimated: number;
+      actual: number;
+      /**
+       * The factor the estimate was produced with. Carried on the sample so a
+       * reader of `agent.jsonl` can reconstruct the implied factor
+       * (`appliedCalibration * ratio`) from this line alone, instead of joining
+       * back to the run's `budget_resolved` record.
+       */
+      appliedCalibration: number;
+      ratio: number;
+      applied: boolean;
+      clamped: boolean;
+    }
+  | {
+      kind: "evidence_split";
+      callSite: StructuredCallSite;
+      groups: number;
+      candidates: number;
+      subdivided: number;
+      payloadBudget: number;
+    }
+  | {
+      kind: "prompt_breakdown";
+      requestId?: string;
+      callSite: StructuredCallSite;
+      estimatedInputTokens: number;
+      breakdown: {
+        contractsTokens: number;
+        evidenceTokens: number;
+        contextTokens: number;
+        pageDescriptionsTokens: number;
+        registryTokens: number;
+        technicalEvidenceTokens?: number;
+      };
+      counts: {
+        bundles: number;
+        entities: number;
+        wikiSections: number;
+        requiredWikiSections: number;
+        optionalWikiSections: number;
+        pageDescriptions: number;
+        registryUnits: number;
+        facts: number;
+        exactSourceRanges: number;
+        exactSourceTexts: number;
+        links: number;
+        technicalEvidenceBlocks?: number;
+      };
+    }
+  | {
+      kind: "structured_validation_retry";
+      callSite: StructuredCallSite;
+      requestId: string;
+      errorClass: string;
+      safeReason: string;
+      bundleCount: number;
+      canSplit: boolean;
+      nextAction: "split_batch" | "repair_prompt" | "fail";
+      entityKeys?: string[];
+      actionCount?: number;
+      skipCount?: number;
+    }
+  | {
+      kind: "llm_request_fingerprint";
+      requestId: string;
+      callSite: StructuredCallSite;
+      transport: "stream" | "non-stream";
+      attempt: number;
+      model: string;
+      stream: boolean;
+      messageCount: number;
+      messageCharLengths: number[];
+      /**
+       * The prepared request as character-class counts, from the same walk
+       * `estimatedInputTokens` is weighed over. The log records prompt lengths and
+       * never prompt text, so these counts are what makes a recorded request
+       * re-measurable — `scripts/derive-recorded-prompts.py` turns one into a
+       * fixture case without reading the vault the prompt came from, which is what
+       * lets every call site and every prompt size reach the fixture.
+       *
+       * These are estimator counts, not `messageCharLengths` summed: content given
+       * as an array is charged part by part here and serialized whole there, and an
+       * image contributes to `imageParts` rather than to any character class.
+       */
+      census?: PromptCensus;
+      estimatedInputTokens: number;
+      outputBudget?: number;
+      responseFormatType?: string;
+      responseFormatName?: string;
+      temperature?: number;
+      topP?: number;
+      hasThinking: boolean;
+      preparedMessagesHash: string;
+    }
+  | ({ kind: "transport_retry_scheduled" } & TransportRetryMetadata)
+  | ({ kind: "transport_retry_recovered" } & TransportRetryMetadata)
+  | ({ kind: "transport_retry_exhausted" } & TransportRetryMetadata)
+  | ({ kind: "native_transport_correlation" } & NativeTransportCorrelationMetadata)
+  | ({ kind: "native_http_response" } & NativeHttpResponseMetadata)
+  | ({ kind: "native_transport_trace" } & NativeTransportTraceMetadata)
+  | {
+      kind: "query_stats";
+      crossDomain: boolean;
+      pagesScanned: number;        // pages read/analyzed
+      pagesSelected: number;       // pages handed to the LLM
+      chunksSelected?: number;     // chunks handed to the LLM
+      candidatePages?: number;     // article pool before final chunk selection
+      domainName?: string;         // Ask Domain only
+      seedCount?: number;          // Ask Domain only -- vector seeds in the selected set
+      graphCount?: number;         // Ask Domain only -- graph-expanded pages in the selected set
+      domainsStudied?: number;     // Ask Wiki only -- domains that yielded candidates
+      domainsTotal?: number;       // Ask Wiki only -- domains configured
+      fromDomains?: string[];      // Ask Wiki only -- domain names in the final set
+      rerankerEnabled?: boolean;
+      rerankerTopN?: number;
+      contextTopN?: number;
+      chunkDupsDropped?: number;   // exact-duplicate chunks removed before rerank
+      reranker?: {
+        enabled: boolean;
+        candidates: number;
+        selected: number;
+        durationMs: number;
+        fallbackReason?: import("./reranker").RerankerFallbackReason;
+      };
+      /** Provider reason when chunk selection scored fewer sections than it collected. */
+      retrievalDegraded?: string;
+    }
+  | { kind: "error"; message: string }
+  | { kind: "exit"; code: number }
+  | { kind: "ask_user"; question: string; options: string[]; toolUseId: string }
+  | { kind: "domain_created"; entry: DomainEntry }
+  | { kind: "source_path_added"; domainId: string; path: string }
+  | { kind: "source_path_removed"; domainId: string; path: string }
+  | { kind: "domain_updated"; domainId: string; patch: { entity_types?: EntityType[]; language_notes?: string; wiki_folder?: string; analyzed_sources?: Record<string, string> } }
+  | DeleteStateCommitEvent
+  | { kind: "rule_fired"; ruleId: string; count: number }
+  | { kind: "eval_meta"; fields: EvalMetaFields }
+  | { kind: "init_start"; totalFiles: number; phase?: "analysis" | "ingest" }
+  | { kind: "file_start"; file: string; index: number; total: number; phase?: "analysis" | "ingest" }
+  | { kind: "file_attempt"; file: string; attempt: number; state: "failed" | "retry_scheduled" | "recovered"; retryable: boolean; message?: string }
+  | { kind: "file_outcome"; file: string; status: "done" | "skipped" | "stopped" | "exhausted" }
+  | { kind: "file_done"; file: string; phase?: "analysis" | "ingest" }
+  | { kind: "format_preview"; tempPath: string; report: string; missingTokens: { token: string; context: string }[]; runId?: string; visionCount?: number }
+  | { kind: "format_applied"; path: string }
+  | { kind: "format_cancelled" }
+  | { kind: "structural_error";
+      callSite: StructuredCallSite;
+      errorType: "json_parse" | "schema_validate" | "empty_output" | "output_limit" | "response_format_fallback" | "frame_parse" | "idle_abort";
+      retryAttempt: number;
+      succeeded: boolean | null;
+      message: string;
+    }
+  | {
+      kind: "graph_stats";
+      seeds: string[];
+      expanded: number;
+      total: number;
+      fromCache: boolean;
+      seedScores: Record<string, number>;
+      expandedPages: string[];
+      expandedScores: Record<string, number>;
+      expandedDense?: Record<string, number>;
+      expandedByHop?: Record<number, string[]>;
+      seedFallback?: "none" | "jaccard" | "llm";
+      retrievalMode?: import("./retrieval-diag").RetrievalMode;
+      denseMax?: number;
+      seedFallbackReason?: import("./retrieval-diag").SeedFallbackReason;
+      floorApplied?: boolean;
+      floorRef?: number;
+      floorLoRef?: number;
+      floorBar?: number;
+      prunedCount?: number;
+      floorSkippedReason?: string;
+    };
+
+export interface RunHistoryEntry {
+  id: string;
+  operation: WikiOperation;
+  args: string[];
+  domainId?: string;
+  startedAt: number;
+  finishedAt: number;
+  status: "done" | "error" | "cancelled";
+  finalText: string;
+  steps: Array<{ kind: "tool_use" | "tool_result"; label: string }>;
+}
+
+/**
+ * Where a resolved context window came from. `configured` is a window the user typed
+ * into settings: it is an override of the DISCOVERED value, so every derived budget
+ * follows from it exactly as if the probe had returned it.
+ */
+export type ContextWindowSource = "configured" | "discovered" | "learned" | "default";
+/** Where a resolved input budget came from; `override` is an explicitly stored budget. */
+export type BudgetInputSource = "override" | ContextWindowSource;
+
+export type CompressionProfile = "maximum" | "balanced" | "minimum";
+export type CompressionOperation = "ingest" | "query" | "lint" | "vision";
+
+export interface SemanticCompression {
+  profile: CompressionProfile;
+  operation: CompressionOperation;
+}
+
+export interface ModelCallPolicy {
+  inputBudgetTokens: number;
+  repairInputBudgetTokens?: number;
+  outputBudgetTokens?: number;
+  compression?: CompressionProfile;
+}
+
+export interface LlmCallOptions {
+  temperature?: number;
+  inputBudgetTokens?: number;
+  repairInputBudgetTokens?: number;
+  maxTokens?: number;
+  /** Maximum output budget available to a fresh retry after the provider consumes maxTokens without content. */
+  outputRetryBudgetTokens?: number;
+  topP?: number | null;
+  systemPrompt?: string;
+  outputLanguage?: OutputLanguage;
+  reasoningLanguage?: OutputLanguage;
+  jsonMode?: "json_object" | "json_schema" | false;
+  jsonSchema?: { name: string; schema: object };
+  structuredRetries?: number;
+  /** @deprecated Numeric `thinking` is not part of OpenAI Chat Completions. Ignored. */
+  thinkingBudgetTokens?: number;
+  /** Opt in to stream_options.include_usage when the provider supports it. */
+  includeStreamUsage?: boolean;
+  mergeDeleteWarnThreshold?: number;
+  dedupOnIngest?: boolean;
+  dedupThreshold?: number;
+  synthesisMaxEntityBatchSize?: number;
+  synthesisMaxEntitiesPerSource?: number;
+  lintNearDuplicate?: boolean;
+  nearDupThreshold?: number;
+  semanticCompression?: SemanticCompression;
+  /** Internal native transport policy resolved from existing top-level settings. */
+  nativeRequestRetries?: number;
+  /** Internal native transport policy resolved from existing top-level settings. */
+  nativeRequestIdleTimeoutMs?: number;
+  /** Internal native transport policy: use a fresh desktop connection for this call. */
+  nativeFreshConnection?: boolean;
+  /** Prefer compact structured repair once the full repair prompt reaches this estimate. */
+  compactRepairThresholdTokens?: number;
+  /** Provider-derived correction applied to every token estimate for this call. */
+  tokenCalibration?: number;
+  /** The model's context window, when known. */
+  contextWindowTokens?: number;
+  /**
+   * Reports the estimate against the provider's own count so the estimator can
+   * self-correct. `calibration` is the factor `estimated` was produced with — it is
+   * part of the measurement, because `tokenCalibration` is fixed for the whole run
+   * while the stored factor moves with every sample.
+   */
+  onUsageObserved?: (sample: { estimated: number; actual?: number; calibration: number }) => void;
+  /**
+   * Reports a provider context rejection so the model's stored window can shrink.
+   * Structurally identical to `ContextErrorDetails` (`src/prompt-budget.ts`), spelled
+   * out here to keep `types.ts` free of an import cycle.
+   */
+  onContextError?: (details: { promptTokens?: number; maxContextTokens?: number }) => void;
+  /** Provenance of the resolved budget, for the prompt_budget diagnostic event. */
+  budgetTelemetry?: {
+    contextWindow: number;
+    inputSource: BudgetInputSource;
+    outputSource: "override" | "default";
+    calibration: number;
+  };
+}
+
+export const NATIVE_TRANSPORT_ATTEMPT_SIGNAL = Symbol("nativeTransportAttemptSignal");
+export const NATIVE_TRANSPORT_CLIENT_REQUEST_ID = Symbol("nativeTransportClientRequestId");
+export const NATIVE_TRANSPORT_TRACEPARENT = Symbol("nativeTransportTraceparent");
+export const NATIVE_TRANSPORT_FRESH_CONNECTION = Symbol("nativeTransportFreshConnection");
+
+export interface NativeChatCompletionCreateOptions {
+  signal: AbortSignal;
+  fetchOptions?: RequestInit & {
+    [NATIVE_TRANSPORT_ATTEMPT_SIGNAL]?: AbortSignal;
+    [NATIVE_TRANSPORT_CLIENT_REQUEST_ID]?: string;
+    [NATIVE_TRANSPORT_TRACEPARENT]?: string;
+    [NATIVE_TRANSPORT_FRESH_CONNECTION]?: boolean;
+  };
+}
+
+export interface LlmChatCompletionCreateOptions {
+  signal?: AbortSignal;
+  retry?: NativeRequestRetryContext;
+}
+
+export interface NativeChatCompletionCreate {
+  (
+    params: OpenAI.Chat.ChatCompletionCreateParamsStreaming,
+    options: NativeChatCompletionCreateOptions,
+  ): Promise<AsyncIterable<OpenAI.Chat.ChatCompletionChunk>>;
+  (
+    params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+    options: NativeChatCompletionCreateOptions,
+  ): Promise<OpenAI.Chat.ChatCompletion>;
+}
+
+export interface NativeRequestLifecycle {
+  begin(attempt: number, transport: "stream" | "non-stream"): void;
+  phase(phase: "sent" | "waiting" | "producing" | "validating"): void;
+  close(phase: "retrying" | "failed" | "cancelled"): void;
+  current(): { id: string; action: LlmLifecycleAction };
+}
+
+export interface NativeRequestRetryContext {
+  logicalRequestId: string;
+  traceId: string;
+  callSite: string;
+  maxRetries: number;
+  maxResponseStartRetries?: number;
+  connectionTimeoutMs: number;
+  idleTimeoutMs: number;
+  signal: AbortSignal;
+  onEvent: (event: RunEvent) => void;
+  lifecycle: NativeRequestLifecycle;
+  nativeTransportDiagnostic?: NativeTransportDiagnostic;
+  nativeFreshConnection?: boolean;
+  consumeNativeHttpResponseDiagnostic?: (signal: AbortSignal) => NativeTransportDiagnostic | undefined;
+  consumeNativeTransportTrace?: (signal: AbortSignal) => NativeTransportTraceSnapshot | undefined;
+  delay: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+export type NativeLlmExecutionInput =
+  | {
+      create: NativeChatCompletionCreate;
+      params: OpenAI.Chat.ChatCompletionCreateParamsStreaming;
+      retry: NativeRequestRetryContext;
+    }
+  | {
+      create: NativeChatCompletionCreate;
+      params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming;
+      retry: NativeRequestRetryContext;
+    };
+
+/** Минимальный интерфейс OpenAI-клиента, используемый фазами. */
+export type LlmClient = {
+  /** True only for the executor-backed native adapter; absent for test clients. */
+  nativeRequestExecutor?: true;
+  /** Configured native DNS/TCP/TLS establishment timeout carried into retry diagnostics. */
+  nativeConnectionTimeoutMs?: number;
+  nativeTransportDiagnostic?: NativeTransportDiagnostic;
+  consumeNativeHttpResponseDiagnostic?: (signal: AbortSignal) => NativeTransportDiagnostic | undefined;
+  consumeNativeTransportTrace?: (signal: AbortSignal) => NativeTransportTraceSnapshot | undefined;
+  emitsPromptBudget?: boolean;
+  beginPromptBudgetRequest?: (requestId: string) => void;
+  chat: {
+    completions: {
+      create(
+        params: OpenAI.Chat.ChatCompletionCreateParamsStreaming,
+        opts?: LlmChatCompletionCreateOptions,
+      ): Promise<AsyncIterable<OpenAI.Chat.ChatCompletionChunk>>;
+      create(
+        params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+        opts?: LlmChatCompletionCreateOptions,
+      ): Promise<OpenAI.Chat.ChatCompletion>;
+    };
+  };
+};
+
+export type NativeTransportDiagnostic = {
+  transport: NativeNetworkTransport;
+  diagnosticMode: NativeTransportDiagnosticMode;
+  endpointPath?: string;
+  status?: number;
+  providerRequestId?: string;
+  clientRequestId?: string;
+  traceparent?: string;
+  requestedScope?: "dns_tcp_tls_establishment";
+  exactConnectTimeoutAvailable?: false;
+  hostTransportRetained?: true;
+};
+
+export type OutputLanguage = "auto" | "ru" | "en" | "es";
+
+export type OpKey = "ingest" | "query" | "lint" | "init" | "format";
+export type OpMap<T> = Record<OpKey, T>;
+
+export interface NativeOperationConfig {
+  model: string;
+  inputBudgetTokens?: number;
+  maxTokens?: number;
+  temperature: number;
+  /** @deprecated Numeric `thinking` is not part of OpenAI Chat Completions. Ignored. */
+  thinkingBudgetTokens?: number;
+  compressionProfile?: CompressionProfile;
+}
+
+export interface LlmWikiPluginSettings {
+  systemPrompt: string;
+  outputLanguage: OutputLanguage;
+  reasoningLanguage: OutputLanguage;
+  agentLogEnabled: boolean;
+  historyLimit: number;
+  graphDepth: number;
+  bfsTopK: number;
+  wikiLinkValidationRetries: number;
+  seedTopK: number;
+  seedMinScore: number;
+  timeouts: {
+    ingest: number;
+    query: number;
+    lint: number;
+    init: number;
+    format: number;
+  };
+  history: RunHistoryEntry[];
+  nativeAgent: {
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+    /**
+     * @deprecated Migration source only. The single global window this setting used
+     * to be is moved onto every native chat model it covered by
+     * `normalizePersistedModelControls`, which then deletes the key.
+     */
+    contextWindowTokens?: number;
+    /**
+     * Context windows in tokens, keyed by MODEL NAME, for backends that do not
+     * advertise one. An entry replaces the DISCOVERED window for that model (no
+     * probe runs) and every budget for it is derived from that number; no entry
+     * means the window is probed as before.
+     *
+     * Keyed by model rather than by role because `ModelContextStore` is: its cache
+     * key is `${baseUrl}::${model}` and every native role shares one `baseUrl`, so a
+     * per-role setting could hand the same store key two different windows.
+     */
+    contextWindowTokensByModel?: Record<string, number>;
+    inputBudgetTokens?: number;
+    repairInputBudgetTokens?: number;
+    maxTokens?: number;
+    compressionProfile: CompressionProfile;
+    temperature: number;
+    topP: number | null;
+    perOperation: boolean;
+    operations: OpMap<NativeOperationConfig>;
+    structuredRetries: number;
+    /** @deprecated Numeric `thinking` is not part of OpenAI Chat Completions. Ignored. */
+    thinkingBudgetTokens?: number;
+    embeddingModel?: string;
+    embeddingDimensions?: number;
+    relevantPagesTopK?: number;
+    rerankerEnabled?: boolean;
+    rerankerModel?: string;
+    rerankerTopN?: number;
+    contextTopN?: number;
+    rerankerTimeoutMs?: number;
+    mergeDeleteWarnThreshold?: number;
+    chunkMaxChars?: number;
+    chunkOverlapChars?: number;
+    chunkMinChars?: number;
+    chunkMaxCount?: number;
+    hybridRetrieval?: boolean;
+    rrfK?: number;
+    bfsFusion?: boolean;
+    bfsMinScoreRatio?: number;
+    seedSimilarityThreshold?: number;
+    dedupOnIngest?: boolean;
+    dedupThreshold?: number;
+    synthesisMaxEntityBatchSize?: number;
+    synthesisMaxEntitiesPerSource?: number;
+    lintNearDuplicate?: boolean;
+    nearDupThreshold?: number;
+  };
+  proxy: {
+    enabled: boolean;
+    url: string;
+    username?: string;
+    noProxy?: string;
+  };
+  devMode: {
+    enabled: boolean;
+    nativeTransportDiagnosticMode: NativeTransportDiagnosticMode;
+  };
+  lintOptions: {
+    useLlm: boolean;
+  };
+  vision: {
+    enabled: boolean;
+    model: string;
+    compressionProfile?: CompressionProfile;
+  };
+  llmConnectionTimeoutSec: number;
+  llmIdleTimeoutSec: number;
+  llmIdleRetries: number;
+}
+
+export const MAX_SAFE_TIMER_MS = 2_147_000_000;
+const MAX_LLM_IDLE_TIMEOUT_SEC = 2_146_999;
+
+function integerInput(value: unknown): number | undefined {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) ? value : undefined;
+  }
+  if (typeof value !== "string" || !/^\d+$/.test(value.trim())) return undefined;
+  const parsed = Number(value.trim());
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+export function parseLlmRetryCount(value: unknown, previous: number): number {
+  const parsed = integerInput(value);
+  return parsed !== undefined && parsed >= 0 ? parsed : previous;
+}
+
+export function parseLlmConnectionTimeoutSec(value: unknown, previous: number): number {
+  const parsed = integerInput(value);
+  return parsed !== undefined && parsed >= 1 ? parsed : previous;
+}
+
+export function parseLlmIdleTimeoutSec(value: unknown, previous: number): number {
+  const parsed = integerInput(value);
+  return parsed !== undefined && parsed >= 0 && parsed <= MAX_LLM_IDLE_TIMEOUT_SEC
+    ? parsed
+    : previous;
+}
+
+export function normalizeLlmRuntimeControls(settings: LlmWikiPluginSettings): void {
+  settings.llmIdleRetries = parseLlmRetryCount(settings.llmIdleRetries, 3);
+  settings.llmConnectionTimeoutSec = parseLlmConnectionTimeoutSec(
+    settings.llmConnectionTimeoutSec,
+    15,
+  );
+  settings.llmIdleTimeoutSec = parseLlmIdleTimeoutSec(settings.llmIdleTimeoutSec, 300);
+  settings.nativeAgent.synthesisMaxEntityBatchSize = Math.max(
+    1,
+    Math.min(10, parseLlmRetryCount(settings.nativeAgent.synthesisMaxEntityBatchSize, 1)),
+  );
+  settings.nativeAgent.synthesisMaxEntitiesPerSource = Math.max(
+    1,
+    Math.min(50, parseLlmRetryCount(settings.nativeAgent.synthesisMaxEntitiesPerSource, 6)),
+  );
+  settings.devMode.nativeTransportDiagnosticMode =
+    settings.devMode.enabled
+      && (
+        settings.devMode.nativeTransportDiagnosticMode === "connection-close"
+        || settings.devMode.nativeTransportDiagnosticMode === "undici-request-adapter"
+      )
+      ? settings.devMode.nativeTransportDiagnosticMode
+      : "off";
+}
+
+export const DEFAULT_SETTINGS: LlmWikiPluginSettings = {
+  systemPrompt: "",
+  outputLanguage: "auto",
+  reasoningLanguage: "en",
+  agentLogEnabled: false,
+  historyLimit: 20,
+  graphDepth: 1,
+  bfsTopK: 10,
+  wikiLinkValidationRetries: 3,
+  seedTopK: 5,
+  seedMinScore: 0.1,
+  timeouts: { ingest: 300, query: 300, lint: 900, init: 3600, format: 600 },
+  history: [],
+  nativeAgent: {
+    baseUrl: "http://localhost:11434/v1",
+    apiKey: "ollama",
+    model: "llama3.2",
+    compressionProfile: "balanced",
+    temperature: 0.2,
+    topP: null,
+    perOperation: false,
+    // No per-operation `inputBudgetTokens` / `maxTokens` defaults: both are optional and
+    // absent means "derive from the model's context window". A default here would be
+    // re-injected by loadSettings' defaults-first merge on the next start, silently
+    // reviving a cleared override as an explicit one.
+    operations: {
+      ingest: { model: "llama3.2", temperature: 0.2 },
+      query:  { model: "llama3.2", temperature: 0.2 },
+      lint:   { model: "llama3.2", temperature: 0.2 },
+      init:   { model: "llama3.2", temperature: 0.2 },
+      format: { model: "llama3.2", temperature: 0.2 },
+    },
+    structuredRetries: 1,
+    rerankerEnabled: false,
+    rerankerModel: "",
+    rerankerTopN: 30,
+    contextTopN: 8,
+    rerankerTimeoutMs: 800,
+    hybridRetrieval: false,
+    rrfK: 60,
+    bfsFusion: false,
+    bfsMinScoreRatio: 0.6, // position of the floor bar within the domain's cosine range [loRef..denseMax]; 0 = floor off
+    seedSimilarityThreshold: 0,
+    dedupOnIngest: false,
+    dedupThreshold: 0.85,
+    synthesisMaxEntityBatchSize: 1,
+    synthesisMaxEntitiesPerSource: 6,
+    lintNearDuplicate: false,
+    nearDupThreshold: 0.80,
+  },
+  proxy: { enabled: false, url: "" },
+  devMode: {
+    enabled: false,
+    nativeTransportDiagnosticMode: "off",
+  },
+  lintOptions: {
+    useLlm: true,
+  },
+  vision: {
+    enabled: false,
+    model: "",
+  },
+  llmConnectionTimeoutSec: 15,
+  llmIdleTimeoutSec: 300,
+  llmIdleRetries: 3,
+};

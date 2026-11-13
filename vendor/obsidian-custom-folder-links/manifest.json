@@ -1,0 +1,10 @@
+{
+	"id": "custom-folder-links",
+	"name": "Custom Folder Links",
+	"version": "1.0.1",
+	"minAppVersion": "1.0.1",
+	"description": "Enables wikilinks pointing to folders, with custom settings to control how those links appear in the editor and what happens when one is clicked.",
+	"author": "ianhays-vibecoded",
+	"authorUrl": "https://github.com/ianhays",
+	"isDesktopOnly": false
+}

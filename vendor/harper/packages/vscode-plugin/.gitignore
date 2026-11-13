@@ -1,0 +1,5 @@
+build
+*.vsix
+LICENSE
+bin
+.vscode-test

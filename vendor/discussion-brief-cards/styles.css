@@ -1,0 +1,156 @@
+/* Styles for Discussion Brief Cards. Light and dark theme through Obsidian CSS variables only. */
+
+.dbc-card {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 10px 12px;
+	margin: 8px 0;
+	background: var(--background-secondary);
+}
+
+.dbc-head {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin-bottom: 4px;
+}
+
+.dbc-title {
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.dbc-meta {
+	color: var(--text-muted);
+	font-size: var(--font-smaller);
+}
+
+.dbc-body {
+	white-space: pre-wrap;
+	margin: 4px 0;
+}
+
+.dbc-answer {
+	margin: 6px 0;
+	padding: 6px 8px;
+	border-radius: 6px;
+	border-left: 3px solid var(--text-muted);
+}
+
+.dbc-answered {
+	border-left-color: var(--text-success);
+}
+
+.dbc-open {
+	border-left-color: var(--text-muted);
+}
+
+.dbc-state {
+	font-weight: 600;
+	font-size: var(--font-smaller);
+}
+
+.dbc-answer-text {
+	white-space: pre-wrap;
+	margin-top: 4px;
+}
+
+.dbc-foot {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 8px;
+	color: var(--text-muted);
+	font-size: var(--font-smaller);
+}
+
+.dbc-full {
+	display: inline-block;
+	margin-top: 4px;
+	font-size: var(--font-smaller);
+}
+
+.dbc-error-text {
+	color: var(--text-error);
+	margin-bottom: 6px;
+}
+
+.dbc-refresh {
+	font-size: var(--font-smaller);
+}
+
+.dbc-list {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 8px 12px;
+	margin: 8px 0;
+	background: var(--background-secondary);
+}
+
+.dbc-list-bar {
+	display: flex;
+	gap: 6px;
+	align-items: center;
+	margin-bottom: 6px;
+}
+
+.dbc-filter {
+	font-size: var(--font-smaller);
+}
+
+.dbc-filter-on {
+	font-weight: 700;
+}
+
+.dbc-list-row {
+	display: flex;
+	gap: 8px;
+	align-items: baseline;
+	padding: 2px 0;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.dbc-list-title {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.dbc-list-state {
+	font-size: var(--font-smaller);
+	color: var(--text-muted);
+	white-space: nowrap;
+}
+
+.dbc-list-meta {
+	font-size: var(--font-smaller);
+	color: var(--text-muted);
+	white-space: nowrap;
+}
+
+.dbc-list-error {
+	color: var(--text-error);
+	font-size: var(--font-smaller);
+}
+
+/* NoteMods What's new tab and settings card */
+.notemods-hello {
+	overflow-y: auto;
+}
+
+.notemods-hello-page {
+	max-width: var(--file-line-width);
+	margin: 0 auto;
+	padding: var(--size-4-6) var(--size-4-4);
+}
+
+.notemods-hello-sub,
+.notemods-hello-blurb {
+	color: var(--text-muted);
+}
+
+.notemods-hello-buttons .setting-item-control {
+	flex-wrap: wrap;
+	justify-content: flex-start;
+}

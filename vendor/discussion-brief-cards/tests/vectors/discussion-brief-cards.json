@@ -1,0 +1,677 @@
+{
+ "slug": "discussion-brief-cards",
+ "module": "discussion-brief-cards/src/parse",
+ "function": "parseDiscussionUrl",
+ "note": "Each case is a tested acceptance case. The function field selects a parse, card, or fetch scenario test.",
+ "cases": [
+  {
+   "name": "plain discussion URL",
+   "args": [
+    "https://github.com/acme/tools/discussions/42"
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42
+   }
+  },
+  {
+   "name": "URL with a query string",
+   "args": [
+    "https://github.com/acme/tools/discussions/42?sort=new"
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42
+   }
+  },
+  {
+   "name": "URL with a trailing slash",
+   "args": [
+    "https://github.com/acme/tools/discussions/42/"
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42
+   }
+  },
+  {
+   "name": "URL with a discussioncomment anchor",
+   "args": [
+    "https://github.com/acme/tools/discussions/42#discussioncomment-1"
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42
+   }
+  },
+  {
+   "name": "URL with surrounding spaces",
+   "args": [
+    "  https://github.com/acme/tools/discussions/42  "
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42
+   }
+  },
+  {
+   "name": "URL with http scheme",
+   "args": [
+    "http://github.com/acme/tools/discussions/42"
+   ],
+   "expected": null,
+   "note": "http is not https; the regex needs the https scheme, so this is null"
+  },
+  {
+   "name": "URL on another host",
+   "args": [
+    "https://example.com/acme/tools/discussions/42"
+   ],
+   "expected": null
+  },
+  {
+   "name": "issue URL",
+   "args": [
+    "https://github.com/acme/tools/issues/42"
+   ],
+   "expected": null
+  },
+  {
+   "name": "pull URL",
+   "args": [
+    "https://github.com/acme/tools/pull/42"
+   ],
+   "expected": null
+  },
+  {
+   "name": "text that is not a URL",
+   "args": [
+    "see the forum thread for details"
+   ],
+   "expected": null
+  },
+  {
+   "name": "URL without a number",
+   "args": [
+    "https://github.com/acme/tools/discussions/"
+   ],
+   "expected": null
+  },
+  {
+   "name": "URL with a number of zero",
+   "args": [
+    "https://github.com/acme/tools/discussions/0"
+   ],
+   "expected": null
+  },
+  {
+   "name": "URL with a negative number",
+   "args": [
+    "https://github.com/acme/tools/discussions/-1"
+   ],
+   "expected": null
+  },
+  {
+   "name": "cache key from one ref",
+   "function": "cacheKey",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    }
+   ],
+   "expected": "acme/tools/42"
+  },
+  {
+   "name": "cache key from a second repo with the same number",
+   "function": "cacheKey",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "kit",
+     "number": 42
+    }
+   ],
+   "expected": "acme/kit/42"
+  },
+  {
+   "name": "cut a short text keeps it",
+   "function": "cutText",
+   "args": [
+    "hello world",
+    1500
+   ],
+   "expected": "hello world"
+  },
+  {
+   "name": "cut past the limit adds an ellipsis",
+   "function": "cutText",
+   "args": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
+    1500
+   ],
+   "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..."
+  },
+  {
+   "name": "cut at exactly the limit keeps it",
+   "function": "cutText",
+   "args": [
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    1500
+   ],
+   "expected": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  {
+   "name": "cut an empty text",
+   "function": "cutText",
+   "args": [
+    "",
+    100
+   ],
+   "expected": null
+  },
+  {
+   "name": "cut a null text",
+   "function": "cutText",
+   "args": [
+    null,
+    100
+   ],
+   "expected": null
+  },
+  {
+   "name": "cut an answer at 800",
+   "function": "cutText",
+   "args": [
+    "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccx",
+    800
+   ],
+   "expected": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc..."
+  },
+  {
+   "name": "whitespace only text is empty",
+   "function": "cutText",
+   "args": [
+    "   ",
+    100
+   ],
+   "expected": null
+  },
+  {
+   "name": "uppercase host is not github.com",
+   "args": [
+    "https://GITHUB.com/acme/tools/discussions/42"
+   ],
+   "expected": null
+  },
+  {
+   "name": "subdomain is not github.com",
+   "args": [
+    "https://www.github.com/acme/tools/discussions/42"
+   ],
+   "expected": null
+  },
+  {
+   "name": "reject a child path",
+   "function": "parseDiscussionUrl",
+   "args": [
+    "https://github.com/acme/tools/discussions/42/extra"
+   ],
+   "expected": null
+  },
+  {
+   "name": "reject a number outside GraphQL Int",
+   "function": "parseDiscussionUrl",
+   "args": [
+    "https://github.com/acme/tools/discussions/2147483648"
+   ],
+   "expected": null
+  },
+  {
+   "name": "response without an answer",
+   "function": "cardFromJson",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    {
+     "title": "Question",
+     "author": {
+      "login": "writer"
+     },
+     "category": {
+      "name": "Q&A"
+     },
+     "bodyText": "Details",
+     "answer": null,
+     "comments": {
+      "totalCount": 3
+     },
+     "updatedAt": "2026-10-01T10:00:00Z"
+    },
+    1000
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42,
+    "title": "Question",
+    "author": "writer",
+    "category": "Q&A",
+    "body": "Details",
+    "answered": false,
+    "answer": null,
+    "comments": 3,
+    "url": "https://github.com/acme/tools/discussions/42",
+    "updatedAt": "2026-10-01T10:00:00Z",
+    "fetchedAt": 1000,
+    "cached": false
+   }
+  },
+  {
+   "name": "response with an answer",
+   "function": "cardFromJson",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    {
+     "title": "Question",
+     "author": {
+      "login": "writer"
+     },
+     "category": {
+      "name": "Q&A"
+     },
+     "bodyText": "Details",
+     "answer": {
+      "bodyText": "Accepted text"
+     },
+     "comments": {
+      "totalCount": 3
+     },
+     "updatedAt": "2026-10-01T10:00:00Z"
+    },
+    1000
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42,
+    "title": "Question",
+    "author": "writer",
+    "category": "Q&A",
+    "body": "Details",
+    "answered": true,
+    "answer": "Accepted text",
+    "comments": 3,
+    "url": "https://github.com/acme/tools/discussions/42",
+    "updatedAt": "2026-10-01T10:00:00Z",
+    "fetchedAt": 1000,
+    "cached": false
+   }
+  },
+  {
+   "name": "null isAnswered falls back to the answer",
+   "function": "cardFromJson",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    {
+     "title": "Question",
+     "author": {
+      "login": "writer"
+     },
+     "category": {
+      "name": "Q&A"
+     },
+     "bodyText": "Details",
+     "answer": {
+      "bodyText": "Accepted text"
+     },
+     "comments": {
+      "totalCount": 3
+     },
+     "updatedAt": "2026-10-01T10:00:00Z",
+     "isAnswered": null
+    },
+    1000
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42,
+    "title": "Question",
+    "author": "writer",
+    "category": "Q&A",
+    "body": "Details",
+    "answered": true,
+    "answer": "Accepted text",
+    "comments": 3,
+    "url": "https://github.com/acme/tools/discussions/42",
+    "updatedAt": "2026-10-01T10:00:00Z",
+    "fetchedAt": 1000,
+    "cached": false
+   }
+  },
+  {
+   "name": "false isAnswered is kept",
+   "function": "cardFromJson",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    {
+     "title": "Question",
+     "author": {
+      "login": "writer"
+     },
+     "category": {
+      "name": "Q&A"
+     },
+     "bodyText": "Details",
+     "answer": null,
+     "comments": {
+      "totalCount": 3
+     },
+     "updatedAt": "2026-10-01T10:00:00Z",
+     "isAnswered": false
+    },
+    1000
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42,
+    "title": "Question",
+    "author": "writer",
+    "category": "Q&A",
+    "body": "Details",
+    "answered": false,
+    "answer": null,
+    "comments": 3,
+    "url": "https://github.com/acme/tools/discussions/42",
+    "updatedAt": "2026-10-01T10:00:00Z",
+    "fetchedAt": 1000,
+    "cached": false
+   }
+  },
+  {
+   "name": "remote HTML remains text",
+   "function": "cardFromJson",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    {
+     "title": "Question",
+     "author": {
+      "login": "writer"
+     },
+     "category": {
+      "name": "Q&A"
+     },
+     "bodyText": "<script>x</script><img src=x>",
+     "answer": null,
+     "comments": {
+      "totalCount": 3
+     },
+     "updatedAt": "2026-10-01T10:00:00Z"
+    },
+    1000
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42,
+    "title": "Question",
+    "author": "writer",
+    "category": "Q&A",
+    "body": "<script>x</script><img src=x>",
+    "answered": false,
+    "answer": null,
+    "comments": 3,
+    "url": "https://github.com/acme/tools/discussions/42",
+    "updatedAt": "2026-10-01T10:00:00Z",
+    "fetchedAt": 1000,
+    "cached": false
+   }
+  },
+  {
+   "name": "long discussion body is cut",
+   "function": "cardFromJson",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    {
+     "title": "Question",
+     "author": {
+      "login": "writer"
+     },
+     "category": {
+      "name": "Q&A"
+     },
+     "bodyText": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "answer": null,
+     "comments": {
+      "totalCount": 3
+     },
+     "updatedAt": "2026-10-01T10:00:00Z"
+    },
+    1000
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42,
+    "title": "Question",
+    "author": "writer",
+    "category": "Q&A",
+    "body": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb...",
+    "answered": false,
+    "answer": null,
+    "comments": 3,
+    "url": "https://github.com/acme/tools/discussions/42",
+    "updatedAt": "2026-10-01T10:00:00Z",
+    "fetchedAt": 1000,
+    "cached": false
+   }
+  },
+  {
+   "name": "long accepted answer is cut",
+   "function": "cardFromJson",
+   "args": [
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    {
+     "title": "Question",
+     "author": {
+      "login": "writer"
+     },
+     "category": {
+      "name": "Q&A"
+     },
+     "bodyText": "Details",
+     "answer": {
+      "bodyText": "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+     },
+     "comments": {
+      "totalCount": 3
+     },
+     "updatedAt": "2026-10-01T10:00:00Z"
+    },
+    1000
+   ],
+   "expected": {
+    "owner": "acme",
+    "repo": "tools",
+    "number": 42,
+    "title": "Question",
+    "author": "writer",
+    "category": "Q&A",
+    "body": "Details",
+    "answered": true,
+    "answer": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc...",
+    "comments": 3,
+    "url": "https://github.com/acme/tools/discussions/42",
+    "updatedAt": "2026-10-01T10:00:00Z",
+    "fetchedAt": 1000,
+    "cached": false
+   }
+  },
+  {
+   "name": "HTTP 401 does not expose the token",
+   "function": "resultFromResponse",
+   "args": [
+    401,
+    {},
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    1000,
+    true
+   ],
+   "expected": {
+    "ok": false,
+    "error": {
+     "kind": "http",
+     "message": "GitHub answered 401 for this token. Check the token in the settings."
+    }
+   }
+  },
+  {
+   "name": "GraphQL NOT_FOUND is clear",
+   "function": "resultFromResponse",
+   "args": [
+    200,
+    {
+     "errors": [
+      {
+       "type": "NOT_FOUND",
+       "message": "hidden token"
+      }
+     ]
+    },
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    1000,
+    true
+   ],
+   "expected": {
+    "ok": false,
+    "error": {
+     "kind": "not-found",
+     "message": "GitHub found no such discussion, or the token may not read it."
+    }
+   }
+  },
+  {
+   "name": "GraphQL rate limit is clear",
+   "function": "resultFromResponse",
+   "args": [
+    200,
+    {
+     "errors": [
+      {
+       "type": "RATE_LIMITED"
+      }
+     ]
+    },
+    {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42
+    },
+    1000,
+    true
+   ],
+   "expected": {
+    "ok": false,
+    "error": {
+     "kind": "rate-limit",
+     "message": "GitHub rate limit reached. Wait, or add a token in the settings."
+    }
+   }
+  },
+  {
+   "name": "one read-only GraphQL POST",
+   "function": "fetchScenario",
+   "args": [
+    "live"
+   ],
+   "expected": {
+    "ok": true,
+    "card": {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42,
+     "title": "Question",
+     "author": "writer",
+     "category": "Q&A",
+     "body": "Details",
+     "answered": false,
+     "answer": null,
+     "comments": 3,
+     "url": "https://github.com/acme/tools/discussions/42",
+     "updatedAt": "2026-10-01T10:00:00Z",
+     "fetchedAt": 1000,
+     "cached": false
+    }
+   }
+  },
+  {
+   "name": "offline fallback keeps cached time",
+   "function": "fetchScenario",
+   "args": [
+    "offline"
+   ],
+   "expected": {
+    "ok": true,
+    "card": {
+     "owner": "acme",
+     "repo": "tools",
+     "number": 42,
+     "title": "Question",
+     "author": "writer",
+     "category": "Q&A",
+     "body": "Details",
+     "answered": false,
+     "answer": null,
+     "comments": 3,
+     "url": "https://github.com/acme/tools/discussions/42",
+     "updatedAt": "2026-10-01T10:00:00Z",
+     "fetchedAt": 1000,
+     "cached": true
+    }
+   }
+  }
+ ]
+}

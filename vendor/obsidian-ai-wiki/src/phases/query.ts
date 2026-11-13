@@ -1,0 +1,564 @@
+import type OpenAI from "openai";
+import type { DomainEntry } from "../domain";
+import type { LlmCallOptions, RunEvent, LlmClient } from "../types";
+import type { VaultTools } from "../vault-tools";
+import { parseWithRetry } from "./parse-with-retry";
+import { createLlmLifecycle } from "./structured-output";
+import { lifecycleEvent } from "../llm-lifecycle";
+import { SeedsSchema } from "./zod-schemas";
+import queryTemplate from "../../prompts/query.md";
+import querySeedsTemplate from "../../prompts/query-seeds.md";
+import { render } from "./template";
+import { domainWikiFolder, isWikiPagePath } from "../wiki-path";
+import { ensureDomainConfig } from "../domain-config";
+import { pageId, bfsExpandRanked } from "../wiki-graph";
+import { fuseVectorGraph } from "../fusion";
+import { graphCache } from "../wiki-graph-cache";
+import { selectSeeds } from "../wiki-seeds";
+import { collectDescriptions } from "../wiki-index";
+import { PageSimilarityService, type SelectedChunk } from "../page-similarity";
+import { seedPassesGate } from "../retrieval-diag";
+import type { RetrievalMode, SeedFallbackReason } from "../retrieval-diag";
+import { promptVersionOf } from "../prompt-version";
+import { runWithLiveEvents } from "./llm-utils";
+import {
+  DEFAULT_BOILERPLATE_DEMOTION_FACTOR,
+  demoteBoilerplateRankedIds,
+  type BoilerplateDemotionConfig,
+} from "../boilerplate-demotion";
+import {
+  normalizeRerankerConfig,
+  rerankChunks,
+  type RerankerRuntime,
+} from "../reranker";
+import { dedupeChunks } from "../chunk-dedup";
+
+import { pruneByRelevance, robustLow, FLOOR_LO_PCT } from "../retrieval-prune";
+import { answerFromContext } from "./query-answer";
+import { selectQueryContextChunks } from "./query-budget";
+
+const DEFAULT_RERANKER_RUNTIME: RerankerRuntime = {
+  config: normalizeRerankerConfig(undefined),
+  baseUrl: "",
+  apiKey: "",
+};
+
+export interface RetrieveCfg {
+  graphDepth: number;
+  seedTopK: number;
+  seedMinScore: number;
+  bfsTopK: number;
+  seedSimilarityThreshold: number;
+  bfsMinScoreRatio?: number;   // 0 / undefined = floor off
+  boilerplateDemotion?: BoilerplateDemotionConfig;
+}
+
+export interface DomainCandidates {
+  domainId: string;
+  pages: Map<string, string>;        // ONLY candidate page content (seeds ∪ bfs)
+  seeds: string[];
+  candidateIds: Set<string>;         // seeds ∪ bfsTopK-expanded
+  seedScores: Record<string, number>;
+  expandedScores: Record<string, number>;
+  graph: Map<string, Set<string>>;
+  annotations: Map<string, string>;  // structured page descriptions of candidates
+  retrievalMode: RetrievalMode;
+  denseMax: number;
+  seedFallback: "none" | "jaccard" | "llm";
+  seedFallbackReason?: SeedFallbackReason;
+  seedOutputTokens: number;          // tokens spent if the llm-seed fallback ran
+  pagesScanned: number;              // total pages in the domain (files.length)
+}
+
+/**
+ * Read pages → select seeds (vector gate → jaccard → optional llm)
+ * → build graph → BFS-rank. Pages are read before seed selection because seeds now score
+ * against each page's frontmatter `description` (collected from the page bodies), not the
+ * `_index.md` annotation line. Yields the existing progress events; returns the candidate
+ * set (seeds ∪ bfs) or null when the domain has no usable seeds.
+ *
+ * `llmSeedFallback` is provided only by single-domain runQuery; cross-domain omits it
+ * so an empty domain is skipped instead of costing one LLM call per domain.
+ */
+export async function* retrieveDomainCandidates(
+  domain: DomainEntry,
+  question: string,
+  vaultTools: VaultTools,
+  similarity: PageSimilarityService | undefined,
+  signal: AbortSignal,
+  cfg: RetrieveCfg,
+  llmSeedFallback?: { llm: LlmClient; model: string; opts: LlmCallOptions },
+): AsyncGenerator<RunEvent, DomainCandidates | null> {
+  if (!domain.wiki_folder || domain.wiki_folder.includes("..")) {
+    yield { kind: "error", message: `Wiki folder ${domain.wiki_folder} is outside the vault.` };
+    return null;
+  }
+  const wikiVaultPath = domainWikiFolder(domain.wiki_folder);
+
+  await ensureDomainConfig(vaultTools, wikiVaultPath);
+  if (signal.aborted) return null;
+
+  // The retrieval overview map now comes from each page's frontmatter `description`
+  // (collectDescriptions), not serialized index records — so the full page set has to
+  // be read before seeds can be scored. This gives up the previous "skip the read when
+  // a domain has no seeds" fast path in exchange for a single source of truth for the
+  // overview text (docs/superpowers/plans/2026-07-09-okf-integration-plan.md Task 5b).
+  yield { kind: "tool_use", name: "Glob", input: { pattern: `${wikiVaultPath}/**/*.md` } };
+  const allFiles = await vaultTools.listFiles(wikiVaultPath);
+  const files = allFiles.filter(isWikiPagePath);
+  yield { kind: "tool_result", ok: true, preview: `${files.length} pages` };
+  if (signal.aborted) return null;
+
+  yield { kind: "tool_use", name: "Read", input: { files: files.length } };
+  const pages = await vaultTools.readAll(files);
+  yield { kind: "tool_result", ok: true, preview: `${pages.size} loaded` };
+  if (signal.aborted) return null;
+
+  const indexAnnotations = collectDescriptions([...pages].map(([path, content]) => ({ path, content })));
+
+  const topK = Math.max(1, Math.min(50, Math.floor(cfg.seedTopK)));
+  const minScore = Math.max(0, Math.min(1, cfg.seedMinScore));
+  let seedOutputTokens = 0;
+
+  let seeds: string[];
+  let seedScores: Record<string, number> = {};
+  let seedFallback: "none" | "jaccard" | "llm" = "none";
+  let retrievalMode: RetrievalMode = "jaccard";
+  let denseMax = 0;
+  let seedFallbackReason: SeedFallbackReason | undefined;
+  let denseByPid: Record<string, number> = {};
+  let embedFailed = false;
+  const syntheticPages = new Map<string, string>(
+    [...indexAnnotations.keys()].map((id) => [`${wikiVaultPath}/${id}.md`, ""]),
+  );
+  if (similarity && (similarity.config.mode === "embedding" || similarity.config.mode === "hybrid")) {
+    retrievalMode = similarity.config.mode;
+    await similarity.loadCache(wikiVaultPath, vaultTools);
+    const allAnnotatedPaths = [...indexAnnotations.keys()].map((id) => `${wikiVaultPath}/${id}.md`);
+    const diag = await similarity.selectRelevantScoredDiag(question, indexAnnotations, allAnnotatedPaths);
+    denseMax = diag.denseMax;
+    denseByPid = diag.denseByPid;
+    embedFailed = diag.embedFailed;
+    const topSelected = diag.results.slice(0, topK);
+    seeds = topSelected.map((x) => pageId(x.path));
+    seedScores = Object.fromEntries(topSelected.map((x) => [pageId(x.path), x.score]));
+    if (!seedPassesGate(denseMax, cfg.seedSimilarityThreshold)) {
+      seedFallbackReason = diag.embedFailed ? "embed-failed" : "low-similarity";
+      const jaccardSeeds = selectSeeds(question, syntheticPages, topK, minScore, indexAnnotations, cfg.boilerplateDemotion);
+      if (jaccardSeeds.length > 0) {
+        seeds = jaccardSeeds.map((x) => x.id);
+        seedScores = Object.fromEntries(jaccardSeeds.map((x) => [x.id, x.score]));
+        seedFallback = "jaccard";
+      } else {
+        seeds = [];
+        seedScores = {};
+        seedFallback = "llm";
+      }
+    }
+  } else {
+    const seedResults = selectSeeds(question, syntheticPages, topK, minScore, indexAnnotations, cfg.boilerplateDemotion);
+    seeds = seedResults.map((x) => x.id);
+    seedScores = Object.fromEntries(seedResults.map((x) => [x.id, x.score]));
+  }
+
+  if (seeds.length === 0 && indexAnnotations.size > 0 && llmSeedFallback) {
+    if (signal.aborted) return null;
+    const allAnnotatedIds = [...indexAnnotations.keys()];
+    yield { kind: "tool_use", name: "SelectSeeds", input: { pages: allAnnotatedIds.length } };
+    const seedOpts = { ...llmSeedFallback.opts, thinkingBudgetTokens: undefined };
+    const seedRes = yield* runWithLiveEvents((emit, operationSignal) =>
+      llmSelectSeeds(
+        question,
+        indexAnnotations,
+        allAnnotatedIds,
+        llmSeedFallback.llm,
+        llmSeedFallback.model,
+        seedOpts,
+        operationSignal,
+        emit,
+      ), signal);
+    if (signal.aborted) {
+      if (seedRes.lifecycle) {
+        yield lifecycleEvent(seedRes.lifecycle.id, seedRes.lifecycle.action, "cancelled");
+      }
+      return null;
+    }
+    signal.throwIfAborted();
+    seeds = seedRes.seeds;
+    seedOutputTokens += seedRes.outputTokens;
+    if (seedRes.lifecycle) {
+      signal.throwIfAborted();
+      yield lifecycleEvent(seedRes.lifecycle.id, seedRes.lifecycle.action, "applying");
+    }
+    if (signal.aborted) {
+      if (seedRes.lifecycle) {
+        yield lifecycleEvent(seedRes.lifecycle.id, seedRes.lifecycle.action, "cancelled");
+      }
+      return null;
+    }
+    yield { kind: "tool_result", ok: seeds.length > 0, preview: `${seeds.length} seeds` };
+    if (seedRes.lifecycle) {
+      yield lifecycleEvent(seedRes.lifecycle.id, seedRes.lifecycle.action, "completed");
+    }
+  }
+  if (signal.aborted) return null;
+
+  if (seeds.length === 0) return null;   // empty domain → caller decides
+
+  const graphResult = graphCache.get(domain.id, pages);
+  const { selectedIds, expandedScores } = await bfsExpandRanked(
+    seeds, graphResult.graph, cfg.graphDepth, pages, question, cfg.bfsTopK, indexAnnotations, similarity,
+  );
+  const seedSet = new Set(seeds);
+  let expandedPages = [...selectedIds].filter((id) => !seedSet.has(id));
+
+  // Raw dense cosine per graph candidate (captured pre-prune) — the floor's actual
+  // decision input, surfaced for observability/tuning. A missing key means the page
+  // had no dense vector, so the floor keeps it.
+  const expandedDense: Record<string, number> = {};
+  for (const id of expandedPages) {
+    if (denseByPid[id] !== undefined) expandedDense[id] = denseByPid[id];
+  }
+
+  // Relevance floor — drop graph-expanded pages whose raw dense cosine falls below a
+  // spread-relative bar `loRef + ratio·(denseMax − loRef)`, where loRef is a robust low
+  // percentile of all domain cosines. Only when scales are comparable: dense mode, strong
+  // seed signal, no seed fallback, finite bfsTopK. Mutates selectedIds/expandedScores.
+  const ratio = cfg.bfsMinScoreRatio ?? 0;
+  let floorApplied = false;
+  let prunedCount = 0;
+  let floorSkippedReason: string | undefined;
+  let floorLoRef: number | undefined;
+  let floorBar: number | undefined;
+  if (ratio > 0) {
+    const eligible =
+      (retrievalMode === "embedding" || retrievalMode === "hybrid") &&
+      denseMax > 0 && !embedFailed && seedFallback === "none" && cfg.bfsTopK > 0;
+    if (!eligible) {
+      floorSkippedReason =
+        retrievalMode === "jaccard" ? "jaccard-mode"
+        : embedFailed ? "embed-failed"
+        : denseMax <= 0 ? "low-dense"
+        : seedFallback !== "none" ? `seed-fallback:${seedFallback}`
+        : "bfs-uncapped";
+    } else if (expandedPages.length > 0) {
+      const loRef = robustLow(Object.values(denseByPid), FLOOR_LO_PCT);
+      const { keep, pruned, bar, collapsed } =
+        pruneByRelevance(expandedPages, denseByPid, denseMax, loRef, ratio);
+      if (collapsed) {
+        floorSkippedReason = "range-collapsed";
+      } else {
+        for (const id of pruned) { selectedIds.delete(id); delete expandedScores[id]; }
+        expandedPages = expandedPages.filter((id) => keep.has(id));
+        prunedCount = pruned.length;
+        floorApplied = true;
+        floorLoRef = loRef;
+        floorBar = bar;
+      }
+    }
+  }
+
+  yield { kind: "graph_stats", seeds, expanded: selectedIds.size, total: files.length, fromCache: graphResult.fromCache, seedScores, expandedPages, expandedScores, expandedDense, seedFallback, retrievalMode, denseMax, seedFallbackReason, floorApplied, floorRef: floorApplied ? denseMax : undefined, floorLoRef, floorBar, prunedCount, floorSkippedReason };
+
+  // Keep only candidate content; let the rest be GC'd (memory bound).
+  const candidatePages = new Map<string, string>();
+  for (const [path, content] of pages) {
+    if (selectedIds.has(pageId(path))) candidatePages.set(path, content);
+  }
+  const annotations = new Map<string, string>();
+  for (const id of selectedIds) { const a = indexAnnotations.get(id); if (a) annotations.set(id, a); }
+
+  return {
+    domainId: domain.id, pages: candidatePages, seeds, candidateIds: selectedIds,
+    seedScores, expandedScores, graph: graphResult.graph, annotations,
+    retrievalMode, denseMax, seedFallback, seedFallbackReason, seedOutputTokens,
+    pagesScanned: files.length,
+  };
+}
+
+export async function* runQuery(
+  args: string[],
+  save: boolean,
+  vaultTools: VaultTools,
+  llm: LlmClient,
+  model: string,
+  domains: DomainEntry[],
+  vaultRoot: string,
+  signal: AbortSignal,
+  graphDepth: number = 1,
+  opts: LlmCallOptions = {},
+  seedTopK: number = 5,
+  seedMinScore: number = 0.1,
+  bfsTopK: number = 10,
+  similarity?: PageSimilarityService,
+  wikiLinkValidationRetries: number = 3,
+  seedSimilarityThreshold: number = 0,
+  bfsFusion: boolean = false,
+  rrfK: number = 60,
+  bfsMinScoreRatio: number = 0,
+  boilerplateDemotion: BoilerplateDemotionConfig = { enabled: true, factor: DEFAULT_BOILERPLATE_DEMOTION_FACTOR },
+  rerankerRuntime: RerankerRuntime = DEFAULT_RERANKER_RUNTIME,
+): AsyncGenerator<RunEvent> {
+  const question = args[0]?.trim();
+  if (!question) {
+    yield { kind: "error", message: "query: question required" };
+    return;
+  }
+
+  const domain = domains[0];
+  if (!domain) {
+    yield { kind: "error", message: "No domain configured. Add a domain in settings." };
+    return;
+  }
+  const start = Date.now();
+  let outputTokens = 0;
+
+  const seedLimit = Math.max(1, Math.min(50, Math.floor(seedTopK)));
+  const cfg = {
+    graphDepth, seedTopK: seedLimit, seedMinScore, bfsTopK, seedSimilarityThreshold, bfsMinScoreRatio, boilerplateDemotion,
+  };
+  const querySimilarity = similarity ? similarity.withBoilerplateDemotion(boilerplateDemotion) : undefined;
+  const cand = yield* retrieveDomainCandidates(
+    domain, question, vaultTools, querySimilarity, signal, cfg,
+    { llm, model, opts },
+  );
+  if (signal.aborted) return;
+  if (!cand) {
+    yield { kind: "error", message: "No relevant pages found for this query." };
+    return;
+  }
+  const wikiVaultPath = domainWikiFolder(domain.wiki_folder);
+  outputTokens += cand.seedOutputTokens;
+
+  const seeds = cand.seeds;
+  const seedScores = cand.seedScores;
+  const expandedScores = cand.expandedScores;
+  const selectedIds = cand.candidateIds;
+  const pages = cand.pages;
+  const seedSet = new Set(seeds);
+  const candidateLimit = rerankerRuntime.config.rerankerTopN;
+  const contextLimit = rerankerRuntime.config.contextTopN;
+  const fusedOrder = bfsFusion
+    ? fuseVectorGraph(seeds, selectedIds, seedScores, expandedScores, cand.graph, graphDepth, rrfK)
+    : undefined;
+  const finalArticleIds = bfsFusion && fusedOrder
+    ? new Set(demoteBoilerplateRankedIds(
+      fusedOrder.filter((id) => selectedIds.has(id)),
+      boilerplateDemotion,
+      candidateLimit,
+    ))
+    : selectedIds;
+  const articleScores = { ...expandedScores, ...seedScores };
+  const fallbackSimilarity = new PageSimilarityService({ mode: "jaccard", topK: candidateLimit, boilerplateDemotion });
+  const chunkSimilarity = querySimilarity ?? fallbackSimilarity;
+  const selectedChunks: SelectedChunk[] = await chunkSimilarity.selectRelevantChunks(
+    question, pages, finalArticleIds, seedSet, articleScores, candidateLimit,
+  );
+  if (signal.aborted) return;
+  if (selectedChunks.length === 0) {
+    yield { kind: "error", message: "No relevant pages found for this query." };
+    return;
+  }
+  const { chunks: dedupedChunks, dropped: chunkDupsDropped } = dedupeChunks(selectedChunks);
+  const reranked = await rerankChunks(question, dedupedChunks, {
+    config: rerankerRuntime.config,
+    baseUrl: rerankerRuntime.baseUrl,
+    apiKey: rerankerRuntime.apiKey,
+    signal,
+    resultTopN: candidateLimit,
+  });
+  if (signal.aborted) return;
+
+  const contextChunks = selectQueryContextChunks(reranked.chunks, contextLimit, question);
+  const entityTypesBlock = buildEntityTypesBlock(domain);
+  const systemPrompt = (packedChunks: readonly SelectedChunk[]): string => {
+    const packedIds = new Set(packedChunks.map((chunk) => chunk.articleId));
+    const selectedIndexLines = [...packedIds]
+      .map((id) => {
+        const annotation = cand.annotations.get(id);
+        return annotation ? `${id}: ${annotation}` : undefined;
+      })
+      .filter((line): line is string => line !== undefined);
+    const indexBlock = selectedIndexLines.length > 0
+      ? `\nWiki index (selected candidates):\n${selectedIndexLines.join("\n")}`
+      : "";
+    const wikiFirst = [...packedIds].sort((a, b) =>
+      Number(b.startsWith("wiki_")) - Number(a.startsWith("wiki_")));
+    const availableLinksBlock = wikiFirst.length === 0 ? "" : [
+      "Valid WikiLink targets (use EXACTLY these, copy verbatim):",
+      ...wikiFirst.map((id) => `- ${id}`),
+      "ONLY link to a target from this list. Never invent or abbreviate stems.",
+    ].join("\n");
+    return render(queryTemplate, {
+      domain_name: domain.name,
+      available_links_block: availableLinksBlock,
+      entity_types_block: entityTypesBlock,
+      index_block: indexBlock,
+    });
+  };
+
+  const ans = yield* answerFromContext({
+    llm, model, opts, signal,
+    systemPrompt, question, chunks: contextChunks,
+    wikiLinkValidationRetries,
+    deferLlmCallStats: true,
+  });
+  if (signal.aborted) return;          // restore prior behavior: no eval_meta/result on abort
+  let answer = ans.answer;
+  outputTokens += ans.outputTokens;
+  const finalContextChunks = ans.selectedChunks;
+  const finalSelectedIds = new Set(finalContextChunks.map((chunk) => chunk.articleId));
+  const seedCount = [...finalSelectedIds].filter((id) => seedSet.has(id)).length;
+  const graphCount = finalSelectedIds.size - seedCount;
+  const rerankerDiagnostics = {
+    enabled: rerankerRuntime.config.enabled,
+    candidates: reranked.candidates,
+    selected: contextChunks.length,
+    durationMs: reranked.durationMs,
+    fallbackReason: reranked.fallbackReason,
+  };
+
+  yield {
+    kind: "query_stats",
+    crossDomain: false,
+    domainName: domain.name,
+    pagesScanned: cand.pagesScanned,
+    pagesSelected: finalSelectedIds.size,
+    candidatePages: selectedIds.size,
+    chunksSelected: finalContextChunks.length,
+    seedCount,
+    graphCount,
+    rerankerEnabled: rerankerRuntime.config.enabled,
+    rerankerTopN: rerankerRuntime.config.rerankerTopN,
+    contextTopN: rerankerRuntime.config.contextTopN,
+    chunkDupsDropped,
+    reranker: rerankerDiagnostics,
+    retrievalDegraded: chunkSimilarity.lastChunkDegrade ?? undefined,
+  };
+  if (ans.llmCallStats) yield ans.llmCallStats;
+
+  yield {
+    kind: "eval_meta",
+    fields: {
+      question,
+      answer,
+      found_pages: [...finalSelectedIds],
+      found_chunks: finalContextChunks.map((chunk) => ({
+        articleId: chunk.articleId,
+        heading: chunk.heading,
+        score: chunk.score,
+      })),
+      promptVersion: promptVersionOf(queryTemplate),
+      retrievalConfig: {
+        mode: similarity?.config.mode === "hybrid" ? "hybrid" : similarity?.config.mode === "embedding" ? "embedding" : "jaccard",
+        seedTopK: seedLimit,
+        bfsTopK,
+        bfsMinScoreRatio,
+        bfsFusion,
+        seedSimilarityThreshold,
+        hybridRetrieval: similarity?.config.mode === "hybrid",
+        hierarchicalChunkRetrieval: true,
+        rerankerEnabled: rerankerRuntime.config.enabled,
+        rerankerTopN: rerankerRuntime.config.rerankerTopN,
+        contextTopN: rerankerRuntime.config.contextTopN,
+        reranker: rerankerDiagnostics,
+      },
+    },
+  };
+
+  if (save && answer) {
+    const slug = question.slice(0, 40).replace(/[^a-zA-Z0-9а-яёА-ЯЁ\s]/g, "").trim().replace(/\s+/g, "-");
+    const savePath = `${wikiVaultPath}/Q-${slug}.md`;
+    const today = new Date().toISOString().slice(0, 10);
+    const pageContent = [
+      `---`,
+      `type: concept`,
+      `resource: []`,
+      `timestamp: ${today}`,
+      `status: mature`,
+      `tags: []`,
+      `---`,
+      ``,
+      `# ${question}`,
+      ``,
+      answer,
+    ].join("\n");
+    yield { kind: "tool_use", name: "Write", input: { path: savePath } };
+    try {
+      await vaultTools.write(savePath, pageContent);
+      yield { kind: "tool_result", ok: true };
+      yield { kind: "result", durationMs: Date.now() - start, text: `Создана страница: ${savePath}\n\n${answer}`, outputTokens: outputTokens || undefined };
+    } catch (e) {
+      yield { kind: "tool_result", ok: false, preview: (e as Error).message };
+      yield { kind: "result", durationMs: Date.now() - start, text: answer, outputTokens: outputTokens || undefined };
+    }
+  } else {
+    yield { kind: "result", durationMs: Date.now() - start, text: answer, outputTokens: outputTokens || undefined };
+  }
+}
+
+async function llmSelectSeeds(
+  question: string,
+  indexAnnotations: Map<string, string>,
+  allPageIds: string[],
+  llm: LlmClient,
+  model: string,
+  opts: LlmCallOptions,
+  signal: AbortSignal,
+  onEvent: (event: RunEvent) => void,
+): Promise<{
+  seeds: string[];
+  outputTokens: number;
+  lifecycle?: ReturnType<typeof createLlmLifecycle>;
+}> {
+  const example = JSON.stringify({
+    reasoning: "PageA matches keyword X; PageB referenced by index.",
+    seeds: ["PageA", "PageB"],
+  }, null, 2);
+  const annotatedLines: string[] = [];
+  const unindexedIds: string[] = [];
+  for (const id of allPageIds) {
+    const ann = indexAnnotations?.get(id);
+    if (ann) annotatedLines.push(`${id}: ${ann}`);
+    else unindexedIds.push(id);
+  }
+  const prompt = render(querySeedsTemplate, {
+    question,
+    annotated: annotatedLines.join("\n"),
+    unindexed: unindexedIds.length ? `\nPages not yet indexed: ${unindexedIds.join(", ")}` : "",
+    example,
+  });
+
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: "user", content: prompt },
+  ];
+
+  try {
+    const r = await parseWithRetry({
+      llm, model, baseMessages: messages, opts,
+      schema: SeedsSchema,
+      maxRetries: opts.structuredRetries ?? 1,
+      callSite: "query.seeds",
+      lifecycle: createLlmLifecycle("select_relevant_pages"),
+      signal,
+      onEvent,
+      transport: "non-stream",
+    });
+    return {
+      seeds: r.value.seeds,
+      outputTokens: r.outputTokens,
+      lifecycle: r.lifecycle,
+    };
+  } catch {
+    return { seeds: [], outputTokens: 0 };
+  }
+}
+
+function buildEntityTypesBlock(domain: DomainEntry): string {
+  if (!domain.entity_types?.length) return "";
+  const types = domain.entity_types
+    .map((et) => `  - ${et.type}: ${et.description}`)
+    .join("\n");
+  const notes = domain.language_notes ? `\nLanguage rules: ${domain.language_notes}` : "";
+  return `Entity types of the domain "${domain.name}":\n${types}${notes}`;
+}

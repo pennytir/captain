@@ -1,0 +1,22 @@
+# vscode
+.vscode
+
+# Intellij
+*.iml
+.idea
+
+# npm
+node_modules
+
+dist/
+main.js
+
+# Exclude sourcemaps
+*.map
+# obsidian
+data.json
+
+.DS_Store
+
+# Snyk Security Extension - AI Rules (auto-generated)
+.github/instructions/snyk_rules.instructions.md

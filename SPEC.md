@@ -181,7 +181,35 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - [ ] End-to-end test jev-auto from Copilot
 - [ ] Run bun install for dev env
 
-### 4.7 Git-based collaboration framework
+### 4.8 Editor code mode, collaboration chat, and plugin integrations
+
+**Requirements**
+- R1. Plugins: version-history-diff, github-issues, githobs, github-review, discussion-brief-cards.
+- R2. Live collaboration chat with @mentions and threaded replies.
+- R3. Harper grammar checker (toggle).
+- R4. Code mode: VS Code-like editor; filetree becomes git worktree sidebar.
+- R5. twibiral in-note code execution.
+- R6. Smart AI autocomplete (toggle, chosen provider).
+- R7. Attribution to original creators.
+
+**Acceptance criteria**
+- Switching to code mode shows VS Code-like layout with worktree sidebar.
+- User can run code in a note via twibiral.
+- Mention in chat notifies the mentioned user.
+- Grammar suggestions appear inline (toggleable).
+
+**Tasks**
+- [ ] Research + integrate 5 plugins
+- [ ] Live chat with mentions/replies
+- [ ] Harper grammar checker
+- [ ] Code mode UI
+- [ ] twibiral integration
+- [ ] AI autocomplete
+- [ ] Attribution (CREDITS.md)
+- [ ] Settings + tests
+
+### 4.7 Git-based collaboration framework:
+
 
 **Requirements**
 - R1. Each published vault is a git repo (local + optional GitHub remote).
@@ -241,6 +269,7 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - **M6**: OpenCodex proxy integration docs (4.5)
 - **M7**: Note linking & AI wiki (4.6)
 - **M8**: Git-based collaboration (4.7)
+- **M9**: Editor code mode, chat, integrations (4.8)
 
 ## 6. Open questions
 

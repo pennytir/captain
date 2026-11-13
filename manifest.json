@@ -1,0 +1,10 @@
+{
+	"id": "captain",
+	"name": "Captain",
+	"version": "0.1.0",
+	"minAppVersion": "1.5.0",
+	"description": "Captain — your Obsidian co-pilot. Chat with your notes (RAG) and your models.",
+	"author": "pennytir",
+	"authorUrl": "https://github.com/pennytir",
+	"isDesktopOnly": true
+}

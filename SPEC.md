@@ -184,13 +184,14 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 ### 4.8 Editor code mode, collaboration chat, and plugin integrations
 
 **Requirements**
-- R1. Plugins: version-history-diff, github-issues, githobs, github-review, discussion-brief-cards.
+- R1. Plugins: version-history-diff, github-issues, githobs, github-review, discussion-brief-cards, inline-agents.
 - R2. Live collaboration chat with @mentions and threaded replies.
 - R3. Harper grammar checker (toggle).
 - R4. Code mode: VS Code-like editor; filetree becomes git worktree sidebar.
 - R5. twibiral in-note code execution.
 - R6. Smart AI autocomplete (toggle, chosen provider).
-- R7. Attribution to original creators.
+- R7. Inline agent buttons: `agent-button` code blocks that run an agent in-note or hand off to an HTTP runtime (incl. OpenCodex proxy as an OpenAI-compatible endpoint).
+- R8. Attribution to original creators.
 
 **Acceptance criteria**
 - Switching to code mode shows VS Code-like layout with worktree sidebar.
@@ -199,12 +200,13 @@ Subdomain routing: `{handle}.obsidi.xyz` -> Worker -> R2 render.
 - Grammar suggestions appear inline (toggleable).
 
 **Tasks**
-- [ ] Research + integrate 5 plugins
+- [ ] Research + integrate 6 plugins (incl. inline-agents)
 - [ ] Live chat with mentions/replies
 - [ ] Harper grammar checker
 - [ ] Code mode UI
 - [ ] twibiral integration
 - [ ] AI autocomplete
+- [ ] Inline agent buttons (`agent-button` blocks + HTTP runtime handoff)
 - [ ] Attribution (CREDITS.md)
 - [ ] Settings + tests
 
